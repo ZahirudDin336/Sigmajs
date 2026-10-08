@@ -1,0 +1,8 @@
+# Local test environment (Python 3.12). Install with the Airflow constraints:
+#   pip install -r requirements-dev.txt \
+#     --constraint https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.12.txt
+apache-airflow==2.10.5
+apache-airflow-providers-apache-impala
+cloudera-airflow-provider
+pyspark==3.5.4
+pytest
