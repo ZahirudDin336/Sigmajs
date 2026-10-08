@@ -4,8 +4,8 @@ Trigger every downstream DAG that is flagged READY in the upstream trigger log.
 Flow:
     start -> validate_edw_connection -> check_ready_list (CDE Spark)
           -> get_ready_dag_names (Impala)
-          -> process_ready_dag[dag_name]  (mapped, one group per DAG)
-                 trigger -> mark_dag_completed
+          -> process_ready_dag[dag_name]  (mapped, one group per DAG,
+                 trigger -> mark_dag_completed     at most MAX_PARALLEL_TRIGGERS at a time)
           -> end
 """
 from __future__ import annotations
@@ -17,6 +17,7 @@ import pendulum
 from airflow import DAG
 from airflow.decorators import task, task_group
 from airflow.hooks.base import BaseHook
+from airflow.models import DagModel
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.apache.impala.hooks.impala import ImpalaHook
@@ -34,6 +35,10 @@ CDE_CONN_ID = 'cde_runtime_api'
 
 # Single place to switch schema between environments (dev_stg -> prd_stg, ...).
 TRIGGER_LOG_TABLE = 'dev_stg.upstream_trigger_log'
+
+# Max downstream DAGs running at the same time. The rest wait in the queue
+# and start as slots free up, so every READY DAG still runs in this run.
+MAX_PARALLEL_TRIGGERS = 6
 
 RUN_DATE = f"{{{{ data_interval_end.in_timezone('{LOCAL_TZ}').strftime('%Y-%m-%d') }}}}"
 
@@ -93,7 +98,12 @@ def validate_edw_connection() -> None:
 
 @task
 def get_ready_dag_names() -> list[str]:
-    """Return the distinct DAG ids currently flagged READY."""
+    """Return the distinct READY DAG ids that can actually be triggered.
+
+    DAGs that don't exist, are paused, or are this DAG itself are skipped
+    (and stay READY): a paused DAG would hold one of the parallel slots until
+    the timeout, a missing one would just fail, and self would loop.
+    """
     hook = ImpalaHook(impala_conn_id=IMPALA_CONN_ID)
     # The Spark job writes this table outside Impala, so Impala's cached
     # metadata can be stale; refresh it before reading.
@@ -105,8 +115,21 @@ def get_ready_dag_names() -> list[str]:
           AND dag_name IS NOT NULL
         ORDER BY dag_name
     """)
-    dag_names = [row[0] for row in records]
-    logger.info('DAGs to trigger (%d): %s', len(dag_names), dag_names)
+    dag_names = []
+    for (dag_name,) in records:
+        dag_model = DagModel.get_dagmodel(dag_name)
+        if dag_name == DAG_ID:
+            logger.warning('Skipping %s: a DAG cannot trigger itself', dag_name)
+        elif dag_model is None:
+            logger.warning('Skipping %s: DAG not found in Airflow', dag_name)
+        elif dag_model.is_paused:
+            logger.warning('Skipping %s: DAG is paused', dag_name)
+        else:
+            dag_names.append(dag_name)
+    logger.info(
+        'DAGs to trigger (%d, max %d at a time): %s',
+        len(dag_names), MAX_PARALLEL_TRIGGERS, dag_names,
+    )
     return dag_names
 
 
@@ -148,8 +171,13 @@ def process_ready_dag(dag_name: str):
         # Set deferrable=True if a triggerer is running, to free worker slots while waiting.
         retries=0,
         execution_timeout=timedelta(hours=6),
+        # Caps concurrent mapped instances; with max_active_runs=1 this is a
+        # global cap of MAX_PARALLEL_TRIGGERS downstream DAGs running at once.
+        max_active_tis_per_dag=MAX_PARALLEL_TRIGGERS,
     )
-    trigger >> mark_dag_completed(dag_name)
+    trigger >> mark_dag_completed.override(
+        max_active_tis_per_dag=MAX_PARALLEL_TRIGGERS,
+    )(dag_name)
 
 
 with DAG(
@@ -161,6 +189,8 @@ with DAG(
     catchup=False,
     # Concurrent runs would read the same READY rows and trigger DAGs twice.
     max_active_runs=1,
+    # Room for the 6 waiting triggers plus their status updates.
+    max_active_tasks=MAX_PARALLEL_TRIGGERS * 2,
     dagrun_timeout=timedelta(hours=8),
     tags=['test', 'dev', 'spark', 'impala', 'iceberg'],
 ) as dag:
