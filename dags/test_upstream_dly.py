@@ -4,8 +4,8 @@ Trigger every downstream DAG that is flagged READY in the upstream trigger log.
 Flow:
     start -> validate_edw_connection -> check_ready_list (CDE Spark)
           -> get_ready_dag_names (Impala)
-          -> process_ready_dag[dag_name]  (mapped, one group per DAG,
-                 trigger -> mark_dag_completed     at most MAX_PARALLEL_TRIGGERS at a time)
+          -> trigger_ready_dag[dag_name]  (mapped, at most MAX_PARALLEL_TRIGGERS at a time)
+          -> mark_dags_completed (marks only the DAGs that succeeded)
           -> end
 """
 from __future__ import annotations
@@ -15,12 +15,14 @@ from datetime import timedelta
 
 import pendulum
 from airflow import DAG
-from airflow.decorators import task, task_group
+from airflow.decorators import task
+from airflow.exceptions import AirflowException
 from airflow.hooks.base import BaseHook
 from airflow.models import DagModel
 from airflow.operators.empty import EmptyOperator
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.providers.apache.impala.hooks.impala import ImpalaHook
+from airflow.utils.state import TaskInstanceState
 from airflow.utils.trigger_rule import TriggerRule
 from cloudera.cdp.airflow.operators.cde_operator import CDEJobRunOperator
 
@@ -39,6 +41,7 @@ TRIGGER_LOG_TABLE = 'dev_stg.upstream_trigger_log'
 # Max downstream DAGs running at the same time. The rest wait in the queue
 # and start as slots free up, so every READY DAG still runs in this run.
 MAX_PARALLEL_TRIGGERS = 6
+TRIGGER_TASK_ID = 'trigger_ready_dag'
 
 RUN_DATE = f"{{{{ data_interval_end.in_timezone('{LOCAL_TZ}').strftime('%Y-%m-%d') }}}}"
 
@@ -133,51 +136,44 @@ def get_ready_dag_names() -> list[str]:
     return dag_names
 
 
-@task
-def mark_dag_completed(dag_name: str) -> None:
-    """Flip a READY row to COMPLETED once its triggered run has succeeded."""
-    hook = ImpalaHook(impala_conn_id=IMPALA_CONN_ID)
-    hook.run(
-        f"""
-        UPDATE {TRIGGER_LOG_TABLE}
-        SET status = 'COMPLETED'
-        WHERE dag_name = %(dag_name)s
-          AND status = 'READY'
-        """,
-        parameters={'dag_name': dag_name},
-    )
-    logger.info('Marked %s as COMPLETED', dag_name)
+@task(trigger_rule=TriggerRule.ALL_DONE)
+def mark_dags_completed(dag_names: list[str] | None, dag_run=None) -> None:
+    """Mark COMPLETED only the DAGs whose triggered run succeeded.
 
-
-@task_group
-def process_ready_dag(dag_name: str):
-    """Trigger one DAG, wait for it, then mark only that DAG as completed.
-
-    Grouping per DAG means one failed downstream DAG no longer blocks the
-    status update of the ones that succeeded; the failed one stays READY and
-    is picked up again on the next run.
+    Runs even when some triggers failed (ALL_DONE), so successful DAGs are
+    always recorded; failed ones stay READY for the next run. The task then
+    fails itself so the overall DAG run still shows the failure.
     """
-    trigger = TriggerDagRunOperator(
-        task_id='trigger',
-        trigger_dag_id=dag_name,
-        # Deterministic run_id + reset_dag_run make retries idempotent:
-        # a retry re-runs the same downstream run instead of starting a new one.
-        trigger_run_id=f'triggered_by__{DAG_ID}__{{{{ run_id }}}}',
-        reset_dag_run=True,
-        wait_for_completion=True,
-        poke_interval=60,
-        allowed_states=['success'],
-        failed_states=['failed'],
-        # Set deferrable=True if a triggerer is running, to free worker slots while waiting.
-        retries=0,
-        execution_timeout=timedelta(hours=6),
-        # Caps concurrent mapped instances; with max_active_runs=1 this is a
-        # global cap of MAX_PARALLEL_TRIGGERS downstream DAGs running at once.
-        max_active_tis_per_dag=MAX_PARALLEL_TRIGGERS,
-    )
-    trigger >> mark_dag_completed.override(
-        max_active_tis_per_dag=MAX_PARALLEL_TRIGGERS,
-    )(dag_name)
+    if not dag_names:
+        logger.info('No DAGs were triggered; nothing to update.')
+        return
+
+    # Map index i of the trigger task corresponds to dag_names[i].
+    states = {
+        ti.map_index: ti.state
+        for ti in dag_run.get_task_instances()
+        if ti.task_id == TRIGGER_TASK_ID
+    }
+    succeeded = [n for i, n in enumerate(dag_names) if states.get(i) == TaskInstanceState.SUCCESS]
+    not_succeeded = [n for i, n in enumerate(dag_names) if states.get(i) != TaskInstanceState.SUCCESS]
+
+    if succeeded:
+        placeholders = ', '.join(f'%(d{i})s' for i in range(len(succeeded)))
+        ImpalaHook(impala_conn_id=IMPALA_CONN_ID).run(
+            f"""
+            UPDATE {TRIGGER_LOG_TABLE}
+            SET status = 'COMPLETED'
+            WHERE status = 'READY'
+              AND dag_name IN ({placeholders})
+            """,
+            parameters={f'd{i}': name for i, name in enumerate(succeeded)},
+        )
+    logger.info('Marked COMPLETED (%d): %s', len(succeeded), succeeded)
+
+    if not_succeeded:
+        raise AirflowException(
+            f'{len(not_succeeded)} triggered DAG(s) did not succeed and remain READY: {not_succeeded}'
+        )
 
 
 with DAG(
@@ -189,18 +185,39 @@ with DAG(
     catchup=False,
     # Concurrent runs would read the same READY rows and trigger DAGs twice.
     max_active_runs=1,
-    # Room for the 6 waiting triggers plus their status updates.
-    max_active_tasks=MAX_PARALLEL_TRIGGERS * 2,
     dagrun_timeout=timedelta(hours=8),
     tags=['test', 'dev', 'spark', 'impala', 'iceberg'],
 ) as dag:
     start = EmptyOperator(task_id='start')
-    # Succeed even when nothing was READY (mapped group is skipped).
+    # Succeed even when nothing was READY (mapped triggers are skipped).
     end = EmptyOperator(task_id='end', trigger_rule=TriggerRule.NONE_FAILED)
 
     check_ready_list = build_cde_job('check_ready_list', 'test_check_ready_list')
     dag_names = get_ready_dag_names()
-    processed = process_ready_dag.expand(dag_name=dag_names)
+
+    # Classic operator mapping (.partial/.expand). Do not put this operator in a
+    # mapped @task_group: DAG serialization fails there with
+    # "unhashable type: 'MappedArgument'".
+    trigger_ready_dags = TriggerDagRunOperator.partial(
+        task_id=TRIGGER_TASK_ID,
+        # Deterministic run_id + reset_dag_run make retries idempotent:
+        # a retry re-runs the same downstream run instead of starting a new one.
+        trigger_run_id=f'triggered_by__{DAG_ID}__{{{{ run_id }}}}',
+        reset_dag_run=True,
+        wait_for_completion=True,
+        poke_interval=60,
+        allowed_states=['success'],
+        failed_states=['failed'],
+        # Set deferrable=True if a triggerer is running, to free worker slots while waiting.
+        retries=0,
+        execution_timeout=timedelta(hours=6),
+        # At most MAX_PARALLEL_TRIGGERS downstream DAGs run at once; with
+        # max_active_runs=1 this cap is global. The rest queue and start as
+        # slots free up.
+        max_active_tis_per_dag=MAX_PARALLEL_TRIGGERS,
+    ).expand(trigger_dag_id=dag_names)
+
+    update_dag_status = mark_dags_completed(dag_names)
 
     start >> validate_edw_connection() >> check_ready_list >> dag_names
-    processed >> end
+    trigger_ready_dags >> update_dag_status >> end
