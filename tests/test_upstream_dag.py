@@ -46,7 +46,7 @@ def test_dag_runs_every_15_minutes_in_qatar_time():
     assert dag.timetable.summary == "*/15 * * * *"
     assert str(dag.timezone.name) == "Asia/Qatar"
     assert dag.catchup is False
-    assert dag.max_active_runs == m.MAX_ACTIVE_RUNS
+    assert dag.max_active_runs == 1  # only one master run at a time
     assert dag.dagrun_timeout == m.DAGRUN_TIMEOUT
     first = dag.next_dagrun_info(None)
     assert first.data_interval.end - first.data_interval.start == pendulum.duration(minutes=15)

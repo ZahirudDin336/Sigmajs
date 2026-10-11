@@ -17,10 +17,10 @@ Runs every 15 minutes (Asia/Qatar). Each run:
    ``FAILED`` (``updated_ts`` on every change). At most ``MAX_PARALLEL_DAGS`` (6)
    run at the same time across all master runs.
 
-Because a run waits for its DAGs, it can last hours. Runs may overlap
-(``max_active_runs``) so new READY DAGs are still picked up every 15 minutes;
-the Spark job and the status checks never run twice at the same time, and a
-DAG is never triggered twice for the same day.
+Only one master run is active at a time (``max_active_runs=1``). A run waits
+for its DAGs, so it can last hours; the next 15-minute run starts when it ends
+(missed intervals are not caught up). A DAG is never triggered twice for the
+same day.
 
 Log row lifecycle: READY -> TRIGGERED -> SUCCEEDED | FAILED. To re-run a FAILED
 DAG the same day, set its rows back to READY.
@@ -83,8 +83,8 @@ CHILD_DAG_TIMEOUT = timedelta(hours=6)
 CDE_JOB_TIMEOUT_SECONDS = 60 * 60
 TASK_TIMEOUT = timedelta(minutes=10)
 DAGRUN_TIMEOUT = CHILD_DAG_TIMEOUT + timedelta(hours=2)
-# Overlapping master runs: one every 15 minutes while DAGs are being waited on.
-MAX_ACTIVE_RUNS = 32
+# Only one master run at a time.
+MAX_ACTIVE_RUNS = 1
 
 # Iceberg uses optimistic concurrency: parallel UPDATEs on the same table can
 # fail with a commit conflict, so Impala statements are retried with backoff.
@@ -515,7 +515,7 @@ with DAG(
 ) as dag:
     start = EmptyOperator(task_id="start")
 
-    # max_active_tis_per_dag=1: these steps never run in two master runs at once.
+    # max_active_tis_per_dag=1: extra guard, these steps never run twice at once.
     @task(max_active_tis_per_dag=1)
     def reconcile_triggered(run_date: str) -> dict[str, list[str]]:
         return reconcile_triggered_dags(get_impala_hook(), run_date, exclude=[DAG_ID])
@@ -567,7 +567,7 @@ with DAG(
         )
         return to_trigger
 
-    # max_active_tis_per_dag caps running child DAGs at 6 across ALL master runs.
+    # At most 6 child DAGs run (and are waited on) at the same time.
     @task(
         max_active_tis_per_dag=MAX_PARALLEL_DAGS,
         execution_timeout=CHILD_DAG_TIMEOUT + timedelta(minutes=15),
