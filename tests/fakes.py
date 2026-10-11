@@ -16,9 +16,11 @@ class FakeImpalaHook:
     tests see exactly the SQL text that would reach Impala.
     """
 
-    def __init__(self, rows: list[dict] | None = None, fail_runs: int = 0, fail_selects: int = 0):
+    def __init__(self, rows: list[dict] | None = None, fail_runs: int = 0, fail_selects: int = 0,
+                 fail_updates: int = 0):
         self.rows = rows or []
         self.fail_runs = fail_runs
+        self.fail_updates = fail_updates
         self.fail_selects = fail_selects
         self.executed: list[str] = []
 
@@ -58,6 +60,9 @@ class FakeImpalaHook:
     def run(self, sql, parameters=None):
         if self.fail_runs:
             self.fail_runs -= 1
+            raise RuntimeError("CommitFailedException: conflicting delete files")
+        if self.fail_updates and sql.lstrip().startswith("UPDATE"):
+            self.fail_updates -= 1
             raise RuntimeError("CommitFailedException: conflicting delete files")
         self.executed.append(_bind_parameters(sql, parameters) if parameters else sql)
         if sql == m.REFRESH_SQL:

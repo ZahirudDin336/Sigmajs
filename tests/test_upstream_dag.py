@@ -46,7 +46,7 @@ def test_dag_runs_every_15_minutes_in_qatar_time():
     assert dag.timetable.summary == "*/15 * * * *"
     assert str(dag.timezone.name) == "Asia/Qatar"
     assert dag.catchup is False
-    assert dag.max_active_runs == 1
+    assert dag.max_active_runs == m.MAX_ACTIVE_RUNS
     assert dag.dagrun_timeout == m.DAGRUN_TIMEOUT
     first = dag.next_dagrun_info(None)
     assert first.data_interval.end - first.data_interval.start == pendulum.duration(minutes=15)
@@ -65,7 +65,14 @@ def test_trigger_task_is_mapped_with_max_six_in_parallel():
 
     trigger = m.dag.get_task("trigger_upstream_dag")
     assert isinstance(trigger, MappedOperator)
-    assert trigger.partial_kwargs["max_active_tis_per_dagrun"] == 6
+    # Across ALL master runs, not just one.
+    assert trigger.partial_kwargs["max_active_tis_per_dag"] == 6
+    assert trigger.partial_kwargs["execution_timeout"] > m.CHILD_DAG_TIMEOUT
+
+
+def test_steps_never_run_twice_at_once():
+    for task_id in ("reconcile_triggered", "check_day_pending", "check_ready_list", "get_dags_to_trigger"):
+        assert m.dag.get_task(task_id).max_active_tis_per_dag == 1, task_id
 
 
 def test_timeouts_and_trigger_rules():
@@ -231,46 +238,128 @@ def test_validate_edw_connection_config():
 
 
 # --------------------------------------------------------------------------- #
-# trigger_upstream
+# trigger_and_wait
 # --------------------------------------------------------------------------- #
-def _trigger(hook, trigger):
-    return m.trigger_upstream(dag_name="dag_a", run_date=RUN_DATE, parent_dag_id=m.DAG_ID,
-                              parent_run_id="scheduled__1", hook=hook, trigger=trigger)
+CHILD_RUN_1 = f"upstream__{RUN_DATE}__1"
 
 
-def test_trigger_upstream_marks_triggered_without_waiting():
-    hook = FakeImpalaHook.with_rows(row("dag_a"))
-    trigger = mock.Mock(return_value="child_run")
-    assert _trigger(hook, trigger) == "child_run"
+def _run(hook, trigger=None, wait=None, existing=(), parent_run_id="scheduled__1"):
+    return m.trigger_and_wait(
+        dag_name="dag_a", run_date=RUN_DATE, parent_dag_id=m.DAG_ID, parent_run_id=parent_run_id, hook=hook,
+        trigger=trigger or mock.Mock(return_value=CHILD_RUN_1),
+        wait=wait or mock.Mock(return_value="success"),
+        list_runs=lambda *_: list(existing),
+    )
+
+
+def test_success_waits_then_marks_succeeded():
+    hook = FakeImpalaHook.with_rows(row("dag_a"), row("dag_a", dataset="ds2"))
+    trigger = mock.Mock(return_value=CHILD_RUN_1)
+    seen = []
+
+    def wait(dag_id, run_id):
+        seen.append((run_id, hook.statuses("dag_a")))
+        return "success"
+
+    assert _run(hook, trigger, wait) == "success"
     trigger.assert_called_once_with(
-        "dag_a", f"upstream__{RUN_DATE}__scheduled__1",
+        "dag_a", CHILD_RUN_1,
         conf={"run_date": RUN_DATE, "parent_dag_id": m.DAG_ID, "parent_run_id": "scheduled__1"},
     )
-    assert hook.status("dag_a") == m.STATUS_TRIGGERED
-    assert hook.rows[0]["triggered_ts"] == NOW
+    # TRIGGERED while waiting, SUCCEEDED after.
+    assert seen == [(CHILD_RUN_1, [m.STATUS_TRIGGERED, m.STATUS_TRIGGERED])]
+    assert hook.statuses("dag_a") == [m.STATUS_SUCCEEDED, m.STATUS_SUCCEEDED]
+    assert all(r["triggered_ts"] == NOW and r["updated_ts"] == NOW for r in hook.rows)
+    final_sql = " ".join(hook.executed[-1].split())
+    assert "SET status = 'SUCCEEDED', updated_ts = now()" in final_sql
 
 
-def test_trigger_upstream_failure_marks_failed():
+def test_child_failure_marks_failed_and_raises():
     hook = FakeImpalaHook.with_rows(row("dag_a"))
-    with pytest.raises(AirflowException, match="is paused"):
-        _trigger(hook, mock.Mock(side_effect=AirflowException("DAG 'dag_a' is paused")))
+    with pytest.raises(AirflowException, match="finished as failed"):
+        _run(hook, wait=mock.Mock(return_value="failed"))
+    assert hook.status("dag_a") == m.STATUS_FAILED
+    assert hook.rows[0]["updated_ts"] == NOW
+    assert "SET status = 'FAILED', updated_ts = now()" in " ".join(hook.executed[-1].split())
+
+
+@pytest.mark.parametrize("error", ["DAG 'dag_a' does not exist", "DAG 'dag_a' is paused"])
+def test_trigger_error_marks_failed(error):
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    wait = mock.Mock()
+    with pytest.raises(AirflowException, match=error):
+        _run(hook, trigger=mock.Mock(side_effect=AirflowException(error)), wait=wait)
+    wait.assert_not_called()
     assert hook.status("dag_a") == m.STATUS_FAILED
     assert hook.rows[0]["updated_ts"] == NOW and hook.rows[0]["triggered_ts"] is None
 
 
-def test_trigger_upstream_status_update_failure_marks_failed(monkeypatch):
+def test_trigger_error_kept_when_failed_update_also_fails(monkeypatch):
     monkeypatch.setattr(m, "IMPALA_ATTEMPTS", 1)
-    hook = FakeImpalaHook.with_rows(row("dag_a"), fail_runs=1)
-    with pytest.raises(RuntimeError):
-        _trigger(hook, mock.Mock(return_value="r"))
-    assert hook.status("dag_a") == m.STATUS_FAILED
-
-
-def test_trigger_upstream_keeps_original_error_if_failed_update_fails(monkeypatch):
-    monkeypatch.setattr(m, "IMPALA_ATTEMPTS", 1)
-    hook = FakeImpalaHook.with_rows(row("dag_a"), fail_runs=5)
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    hook.fail_updates = 5
     with pytest.raises(AirflowException, match="does not exist"):
-        _trigger(hook, mock.Mock(side_effect=AirflowException("DAG 'dag_a' does not exist")))
+        _run(hook, trigger=mock.Mock(side_effect=AirflowException("DAG 'dag_a' does not exist")))
+
+
+def test_wait_timeout_leaves_triggered_for_reconcile():
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    with pytest.raises(m.ChildRunTimeout):
+        _run(hook, wait=mock.Mock(side_effect=m.ChildRunTimeout("still running")))
+    assert hook.status("dag_a") == m.STATUS_TRIGGERED
+
+
+def test_triggered_update_failure_does_not_stop_waiting(monkeypatch):
+    monkeypatch.setattr(m, "IMPALA_ATTEMPTS", 1)
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    hook.fail_updates = 1  # the TRIGGERED update
+    assert _run(hook) == "success"
+    assert hook.status("dag_a") == m.STATUS_SUCCEEDED  # final update also covers READY rows
+
+
+def test_retry_reattaches_to_own_run():
+    hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_TRIGGERED))
+    trigger, wait = mock.Mock(), mock.Mock(return_value="success")
+    own = m.ChildRun(CHILD_RUN_1, "running", "scheduled__1")
+    assert _run(hook, trigger, wait, existing=[own]) == "success"
+    trigger.assert_not_called()
+    wait.assert_called_once_with("dag_a", CHILD_RUN_1)
+    assert hook.status("dag_a") == m.STATUS_SUCCEEDED
+
+
+def test_skips_dag_owned_by_another_master_run():
+    hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_TRIGGERED))
+    trigger, wait = mock.Mock(), mock.Mock()
+    other = m.ChildRun(CHILD_RUN_1, "running", "scheduled__0")
+    assert _run(hook, trigger, wait, existing=[other]) == "skipped"
+    trigger.assert_not_called()
+    wait.assert_not_called()
+    assert hook.status("dag_a") == m.STATUS_TRIGGERED
+
+
+def test_skips_dag_finished_while_waiting_for_a_slot():
+    hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_SUCCEEDED))
+    trigger = mock.Mock()
+    done = m.ChildRun(CHILD_RUN_1, "success", "scheduled__0")
+    assert _run(hook, trigger, existing=[done]) == "skipped"
+    trigger.assert_not_called()
+    assert hook.status("dag_a") == m.STATUS_SUCCEEDED
+
+
+def test_skips_when_another_master_run_wins_the_trigger_race():
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    trigger = mock.Mock(side_effect=m.ChildRunAlreadyExists("taken"))
+    assert _run(hook, trigger) == "skipped"
+    assert hook.status("dag_a") == m.STATUS_READY
+
+
+def test_rerun_after_reset_to_ready_uses_next_attempt():
+    hook = FakeImpalaHook.with_rows(row("dag_a"))  # FAILED row was reset to READY
+    trigger = mock.Mock(return_value=f"upstream__{RUN_DATE}__2")
+    failed_before = m.ChildRun(CHILD_RUN_1, "failed", "scheduled__0")
+    assert _run(hook, trigger, existing=[failed_before]) == "success"
+    assert trigger.call_args.args[1] == f"upstream__{RUN_DATE}__2"
+    assert hook.status("dag_a") == m.STATUS_SUCCEEDED
 
 
 # --------------------------------------------------------------------------- #
@@ -345,18 +434,20 @@ def _set_state(run_id, state):
 def test_trigger_child_dag_creates_queued_run(child_dag):
     from airflow.models import DagRun
 
-    run_id = m.trigger_child_dag("child_dag", m.build_child_run_id(RUN_DATE, "p1"), conf={"run_date": RUN_DATE})
+    run_id = m.trigger_child_dag("child_dag", m.build_child_run_id(RUN_DATE, 1),
+                                 conf={"run_date": RUN_DATE, "parent_run_id": "p1"})
     (dag_run,) = DagRun.find(dag_id="child_dag", run_id=run_id)
-    assert run_id == "upstream__2026-10-11__p1"
+    assert run_id == "upstream__2026-10-11__1"
     assert dag_run.state == DagRunState.QUEUED
-    assert dag_run.conf == {"run_date": RUN_DATE}
+    assert dag_run.conf == {"run_date": RUN_DATE, "parent_run_id": "p1"}
 
 
-def test_trigger_child_dag_reuses_run_on_retry(child_dag):
+def test_trigger_child_dag_same_run_id_twice_is_rejected(child_dag):
     from airflow.models import DagRun
 
     m.trigger_child_dag("child_dag", "upstream__x__1")
-    assert m.trigger_child_dag("child_dag", "upstream__x__1") == "upstream__x__1"
+    with pytest.raises(m.ChildRunAlreadyExists):
+        m.trigger_child_dag("child_dag", "upstream__x__1")
     assert len(DagRun.find(dag_id="child_dag")) == 1
 
 
@@ -372,29 +463,76 @@ def test_trigger_child_dag_unknown_or_paused(child_dag):
         m.trigger_child_dag("child_dag", "r1")
 
 
-def test_find_latest_child_run(child_dag):
+def test_list_and_find_child_runs(child_dag):
     assert m.find_latest_child_run("child_dag", RUN_DATE) is None
 
-    first = m.trigger_child_dag("child_dag", m.build_child_run_id(RUN_DATE, "p1"))
+    first = m.trigger_child_dag("child_dag", m.build_child_run_id(RUN_DATE, 1), conf={"parent_run_id": "p1"})
     _set_state(first, DagRunState.FAILED)
-    m.trigger_child_dag("child_dag", m.build_child_run_id("2026-10-12", "p9"))  # another day
-    m.trigger_child_dag("child_dag", "manual__something")                       # not ours
+    m.trigger_child_dag("child_dag", m.build_child_run_id("2026-10-12", 1))  # another day
+    m.trigger_child_dag("child_dag", "manual__something")                    # not ours
     assert m.find_latest_child_run("child_dag", RUN_DATE) == (first, "failed")
 
-    # Re-run after a FAILED row was reset to READY: the newest run wins.
-    second = m.trigger_child_dag("child_dag", m.build_child_run_id(RUN_DATE, "p2"))
-    assert m.find_latest_child_run("child_dag", RUN_DATE) == (second, "queued")
+    second = m.trigger_child_dag("child_dag", m.build_child_run_id(RUN_DATE, 2), conf={"parent_run_id": "p2"})
+    assert m.list_child_runs("child_dag", RUN_DATE) == [
+        m.ChildRun(second, "queued", "p2"), m.ChildRun(first, "failed", "p1")]
     _set_state(second, DagRunState.SUCCESS)
     assert m.find_latest_child_run("child_dag", RUN_DATE) == (second, "success")
 
 
 def test_find_latest_child_run_escapes_like_wildcards(child_dag):
-    m.trigger_child_dag("child_dag", "upstreamX_2026-10-11__p1")
+    m.trigger_child_dag("child_dag", "upstreamX_2026-10-11__1")
     assert m.find_latest_child_run("child_dag", RUN_DATE) is None
 
 
+@pytest.mark.parametrize("final_state", [DagRunState.SUCCESS, DagRunState.FAILED])
+def test_wait_for_dag_run_returns_final_state(child_dag, final_state):
+    run_id = m.trigger_child_dag("child_dag", f"wait_{final_state}")
+    polls = []
+
+    def fake_sleep(_seconds):
+        polls.append(1)
+        _set_state(run_id, DagRunState.RUNNING if len(polls) == 1 else final_state)
+
+    assert m.wait_for_dag_run("child_dag", run_id, poke_interval=0, sleep=fake_sleep) == final_state.value
+    assert len(polls) == 2
+
+
+def test_wait_for_dag_run_times_out(child_dag):
+    run_id = m.trigger_child_dag("child_dag", "wait_timeout")
+    now = [0.0]
+
+    def fake_sleep(seconds):
+        now[0] += seconds
+
+    with pytest.raises(m.ChildRunTimeout):
+        m.wait_for_dag_run("child_dag", run_id, poke_interval=60, timeout=300, sleep=fake_sleep,
+                           clock=lambda: now[0])
+    assert now[0] == 300
+
+
+def test_wait_for_dag_run_missing_run(airflow_db):
+    with pytest.raises(AirflowException, match="not found"):
+        m.wait_for_dag_run("child_dag", "missing")
+
+
+def test_trigger_and_wait_against_real_metadata_db(child_dag):
+    hook = FakeImpalaHook.with_rows(row("child_dag"))
+
+    def finish(dag_id, run_id):
+        _set_state(run_id, DagRunState.SUCCESS)
+        return m.wait_for_dag_run(dag_id, run_id, poke_interval=0)
+
+    assert m.trigger_and_wait(dag_name="child_dag", run_date=RUN_DATE, parent_dag_id=m.DAG_ID,
+                              parent_run_id="p1", hook=hook, wait=finish) == "success"
+    assert hook.status("child_dag") == m.STATUS_SUCCEEDED
+    # A second master run for the same day does not trigger it again.
+    assert m.trigger_and_wait(dag_name="child_dag", run_date=RUN_DATE, parent_dag_id=m.DAG_ID,
+                              parent_run_id="p2", hook=hook) == "skipped"
+    assert len(m.list_child_runs("child_dag", RUN_DATE)) == 1
+
+
 def test_reconcile_against_real_child_run(child_dag):
-    run_id = m.trigger_child_dag("child_dag", m.build_child_run_id(RUN_DATE, "p1"))
+    run_id = m.trigger_child_dag("child_dag", m.build_child_run_id(RUN_DATE, 1))
     hook = FakeImpalaHook.with_rows(row("child_dag", m.STATUS_TRIGGERED))
     assert m.reconcile_triggered_dags(hook, RUN_DATE)["running"] == ["child_dag"]
     _set_state(run_id, DagRunState.SUCCESS)
@@ -406,32 +544,43 @@ def test_reconcile_against_real_child_run(child_dag):
 # End to end: several 15-minute runs of the whole DAG with dag.test()
 # --------------------------------------------------------------------------- #
 class World:
-    """Child DAG runs as the master DAG sees them through the metadata DB."""
+    """Child DAGs as the master DAG sees them: ``outcome`` is how each one ends."""
 
     def __init__(self, monkeypatch, hook):
         self.hook = hook
-        self.child_state: dict[str, str] = {}
-        self.triggered: list[str] = []
+        self.outcome: dict[str, str] = {}
+        self.runs: dict[str, list[m.ChildRun]] = {}
         self.cde_runs = 0
+        self.seen_while_waiting: dict[str, str] = {}
         monkeypatch.setenv("AIRFLOW_CONN_ORACLE-CONN-EDWDB", EDW_CONN)
         monkeypatch.setattr(m, "get_impala_hook", lambda: hook)
         monkeypatch.setattr(m, "trigger_child_dag", self.trigger)
-        monkeypatch.setattr(m, "find_latest_child_run", self.find)
+        monkeypatch.setattr(m, "list_child_runs", lambda dag_id, _: list(reversed(self.runs.get(dag_id, []))))
+        monkeypatch.setattr(m, "find_latest_child_run",
+                            lambda dag_id, _: (lambda r: (r[-1].run_id, r[-1].state) if r else None)(
+                                self.runs.get(dag_id, [])))
+        monkeypatch.setattr(m, "wait_for_dag_run", self.wait)
 
         def execute(op, context, **_):  # stands in for the CDE API call
             self.cde_runs += 1
 
         monkeypatch.setattr(m.CDEJobRunOperator, "execute", execute)
 
+    @property
+    def triggered(self) -> list[str]:
+        return [dag for dag, runs in self.runs.items() for _ in runs]
+
     def trigger(self, dag_id, run_id, conf=None):
         if dag_id == "missing_dag":
             raise AirflowException("DAG 'missing_dag' does not exist")
-        self.triggered.append(dag_id)
-        self.child_state[dag_id] = "queued"
+        self.runs.setdefault(dag_id, []).append(m.ChildRun(run_id, "queued", conf["parent_run_id"]))
         return run_id
 
-    def find(self, dag_id, run_date):
-        return (f"run_{dag_id}", self.child_state[dag_id]) if dag_id in self.child_state else None
+    def wait(self, dag_id, run_id):
+        self.seen_while_waiting[dag_id] = self.hook.status(dag_id)
+        state = self.outcome.get(dag_id, "success")
+        self.runs[dag_id][-1] = m.ChildRun(run_id, state, self.runs[dag_id][-1].parent_run_id)
+        return state
 
     def run(self, hhmm: str):
         hour, minute = map(int, hhmm.split(":"))
@@ -445,48 +594,46 @@ def test_end_to_end_day(airflow_db, monkeypatch):
     hook = FakeImpalaHook.with_rows(*[row(n, time=f"0{i}:00:00") for i, n in enumerate(names[:5])],
                                     row("dag_old", day="2026-10-10"))
     world = World(monkeypatch, hook)
+    world.outcome.update(dag_2="failed")
 
-    # 08:00 - five DAGs READY: all triggered in parallel, run finishes at once.
+    # 08:00 - five DAGs READY: triggered in parallel, each waited for and finalised.
     dag_run, states = world.run("08:00")
-    assert dag_run.state == DagRunState.SUCCESS
     assert sorted(world.triggered) == names[:5]
-    assert all(hook.status(n) == m.STATUS_TRIGGERED for n in names[:5])
-    assert len([k for k in states if k[0] == "trigger_upstream_dag"]) == 5
+    assert world.seen_while_waiting == {n: m.STATUS_TRIGGERED for n in names[:5]}
+    assert [hook.status(n) for n in names[:5]] == [m.STATUS_SUCCEEDED, m.STATUS_SUCCEEDED, m.STATUS_FAILED,
+                                                   m.STATUS_SUCCEEDED, m.STATUS_SUCCEEDED]
+    assert all(r["updated_ts"] == NOW for r in hook.rows if r["dag_name"] in names)
     assert hook.status("dag_old", "2026-10-10") == m.STATUS_READY
+    mapped = [s for (task_id, _), s in states.items() if task_id == "trigger_upstream_dag"]
+    assert sorted(mapped) == sorted([TaskInstanceState.SUCCESS] * 4 + [TaskInstanceState.FAILED])
+    assert states[("end", -1)] == TaskInstanceState.UPSTREAM_FAILED
+    assert dag_run.state == DagRunState.FAILED  # a DAG failed: visible in the UI / alerts
 
-    # 08:15 - three finished (2 ok, 1 failed), the sixth DAG became READY.
-    world.child_state.update(dag_0="success", dag_1="success", dag_2="failed", dag_3="running")
-    hook.rows.append(row("dag_5", time="08:10:00"))
+    # 08:15 - nothing new: nothing triggered again.
     dag_run, states = world.run("08:15")
     assert dag_run.state == DagRunState.SUCCESS
-    assert [hook.status(n) for n in names] == [m.STATUS_SUCCEEDED, m.STATUS_SUCCEEDED, m.STATUS_FAILED,
-                                               m.STATUS_TRIGGERED, m.STATUS_TRIGGERED, m.STATUS_TRIGGERED]
-    assert world.triggered.count("dag_5") == 1 and world.triggered.count("dag_0") == 1
+    assert states[("trigger_upstream_dag", -1)] == TaskInstanceState.SKIPPED
+    assert len(world.triggered) == 5
 
-    # 08:30 - nothing new: no trigger, the run still ends.
+    # 08:30 - the sixth DAG becomes READY and succeeds.
+    hook.rows.append(row("dag_5", time="08:20:00"))
     dag_run, states = world.run("08:30")
     assert dag_run.state == DagRunState.SUCCESS
-    assert states[("trigger_upstream_dag", -1)] == TaskInstanceState.SKIPPED
+    assert hook.status("dag_5") == m.STATUS_SUCCEEDED
+    assert sorted(world.triggered) == names
+
+    # 08:45 - all six finished: run stops early, no Spark job, until tomorrow.
+    cde_runs = world.cde_runs
+    for hhmm in ("08:45", "09:00"):
+        dag_run, states = world.run(hhmm)
+        assert states[("check_day_pending", -1)] == TaskInstanceState.SUCCESS
+        assert states[("check_ready_list", -1)] == TaskInstanceState.SKIPPED
+        assert states[("end", -1)] == TaskInstanceState.SKIPPED
+    assert world.cde_runs == cde_runs
     assert len(world.triggered) == 6
 
-    # 08:45 - all six finished: statuses updated, rest of the run skipped.
-    world.child_state.update(dag_3="success", dag_4="failed", dag_5="success")
-    cde_runs = world.cde_runs
-    dag_run, states = world.run("08:45")
-    assert [hook.status(n) for n in names] == [m.STATUS_SUCCEEDED, m.STATUS_SUCCEEDED, m.STATUS_FAILED,
-                                               m.STATUS_SUCCEEDED, m.STATUS_FAILED, m.STATUS_SUCCEEDED]
-    assert states[("check_day_pending", -1)] == TaskInstanceState.SUCCESS
-    assert states[("check_ready_list", -1)] == TaskInstanceState.SKIPPED
-    assert states[("end", -1)] == TaskInstanceState.SKIPPED
-    assert world.cde_runs == cde_runs  # no Spark job once the day is complete
 
-    # 09:00 - stays stopped for the rest of the day.
-    dag_run, states = world.run("09:00")
-    assert states[("check_ready_list", -1)] == TaskInstanceState.SKIPPED
-    assert world.cde_runs == cde_runs
-
-
-def test_end_to_end_max_six_running(airflow_db, monkeypatch):
+def test_end_to_end_at_most_six_selected(airflow_db, monkeypatch):
     names = [f"dag_{i}" for i in range(9)]
     monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_EXPECTED_DAG_COUNT", "9")
     hook = FakeImpalaHook.with_rows(*[row(n, time=f"0{i}:00:00") for i, n in enumerate(names)])
@@ -496,13 +643,25 @@ def test_end_to_end_max_six_running(airflow_db, monkeypatch):
     assert sorted(world.triggered) == names[:6]  # oldest first, capped at 6
     assert [hook.status(n) for n in names[6:]] == [m.STATUS_READY] * 3
 
-    world.child_state.update(dag_0="success", dag_1="failed")
     world.run("10:15")
-    assert sorted(world.triggered) == names[:8]  # two slots freed
-    assert hook.status("dag_8") == m.STATUS_READY
+    assert sorted(world.triggered) == names
+    assert all(hook.status(n) == m.STATUS_SUCCEEDED for n in names)
 
 
-def test_end_to_end_trigger_failure_is_logged_and_others_continue(airflow_db, monkeypatch):
+def test_end_to_end_running_dags_count_against_the_limit(airflow_db, monkeypatch):
+    # Four DAGs are still running from an earlier master run.
+    hook = FakeImpalaHook.with_rows(*[row(f"busy_{i}", m.STATUS_TRIGGERED) for i in range(4)],
+                                    *[row(f"new_{i}", time=f"0{i}:00:00") for i in range(4)])
+    world = World(monkeypatch, hook)
+    for i in range(4):
+        world.runs[f"busy_{i}"] = [m.ChildRun(f"upstream__{RUN_DATE}__1", "running", "earlier_run")]
+
+    world.run("11:00")
+    assert sorted(d for d in world.triggered if d.startswith("new_")) == ["new_0", "new_1"]
+    assert [hook.status(f"busy_{i}") for i in range(4)] == [m.STATUS_TRIGGERED] * 4
+
+
+def test_end_to_end_trigger_failure_marks_failed_and_others_continue(airflow_db, monkeypatch):
     hook = FakeImpalaHook.with_rows(row("dag_a"), row("missing_dag"), row("dag_b"))
     world = World(monkeypatch, hook)
 
@@ -510,11 +669,8 @@ def test_end_to_end_trigger_failure_is_logged_and_others_continue(airflow_db, mo
 
     assert sorted(world.triggered) == ["dag_a", "dag_b"]
     assert hook.status("missing_dag") == m.STATUS_FAILED
-    assert hook.status("dag_a") == m.STATUS_TRIGGERED
-    mapped = [s for (task_id, _), s in states.items() if task_id == "trigger_upstream_dag"]
-    assert sorted(mapped) == sorted([TaskInstanceState.SUCCESS, TaskInstanceState.SUCCESS,
-                                     TaskInstanceState.FAILED])
-    assert dag_run.state == DagRunState.FAILED  # visible in the UI / alerts
+    assert hook.status("dag_a") == m.STATUS_SUCCEEDED
+    assert dag_run.state == DagRunState.FAILED
 
 
 def test_end_to_end_impala_down_fails_run(airflow_db, monkeypatch):

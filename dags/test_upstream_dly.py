@@ -1,25 +1,29 @@
 """
 Upstream trigger orchestration DAG (master DAG).
 
-Runs every 15 minutes (Asia/Qatar). Every run is short: it never waits for the
-DAGs it triggers, so it does not keep running. One run does:
+Runs every 15 minutes (Asia/Qatar). Each run:
 
-1. ``reconcile_triggered``  - for every DAG marked ``TRIGGERED`` today, look up
-   its Airflow run and set the log row to ``SUCCEEDED`` / ``FAILED`` (with
-   ``updated_ts``) once that run has finished.
+1. ``reconcile_triggered``  - safety net: any DAG still ``TRIGGERED`` whose
+   Airflow run already finished (e.g. its master task was killed) gets its log
+   row set to ``SUCCEEDED`` / ``FAILED``.
 2. ``check_day_pending``    - if all expected DAGs (Variable
-   ``upstream_expected_dag_count``, default 6) have finished today, skip the
-   rest of this run and every later run today; the next day starts afresh.
+   ``upstream_expected_dag_count``, default 6) finished today, skip the rest of
+   this run and every later run today; the next day starts afresh.
 3. ``validate_edw_connection`` + ``check_ready_list`` (CDE Spark job) - load
-   new READY rows for today from the source into ``dev_stg.upstream_trigger_log``.
-4. ``get_dags_to_trigger``  - READY DAGs of today that have not run yet, limited
-   so that at most ``MAX_PARALLEL_DAGS`` (6) child DAGs run at the same time.
-5. ``trigger_upstream_dag`` - triggers them in parallel and marks them
-   ``TRIGGERED`` (``triggered_ts``, ``updated_ts``); a DAG that cannot be
-   triggered is marked ``FAILED``.
+   new READY rows for today into ``dev_stg.upstream_trigger_log``.
+4. ``get_dags_to_trigger``  - READY DAGs of today that have not run yet.
+5. ``trigger_upstream_dag`` - for each DAG, in parallel: trigger it, set the row
+   to ``TRIGGERED``, WAIT for the DAG run to finish, then set ``SUCCEEDED`` or
+   ``FAILED`` (``updated_ts`` on every change). At most ``MAX_PARALLEL_DAGS`` (6)
+   run at the same time across all master runs.
 
-Log row lifecycle: READY -> TRIGGERED -> SUCCEEDED | FAILED. Each DAG is run
-once per day. To re-run a FAILED DAG the same day, set its rows back to READY.
+Because a run waits for its DAGs, it can last hours. Runs may overlap
+(``max_active_runs``) so new READY DAGs are still picked up every 15 minutes;
+the Spark job and the status checks never run twice at the same time, and a
+DAG is never triggered twice for the same day.
+
+Log row lifecycle: READY -> TRIGGERED -> SUCCEEDED | FAILED. To re-run a FAILED
+DAG the same day, set its rows back to READY.
 
 Airflow configuration
 ---------------------
@@ -74,9 +78,13 @@ STATUS_FAILED = "FAILED"
 FINISHED_STATUSES = (STATUS_SUCCEEDED, STATUS_FAILED)
 
 CHILD_RUN_ID_PREFIX = "upstream"
+CHILD_POKE_INTERVAL = timedelta(seconds=60)
+CHILD_DAG_TIMEOUT = timedelta(hours=6)
 CDE_JOB_TIMEOUT_SECONDS = 60 * 60
 TASK_TIMEOUT = timedelta(minutes=10)
-DAGRUN_TIMEOUT = timedelta(hours=2)
+DAGRUN_TIMEOUT = CHILD_DAG_TIMEOUT + timedelta(hours=2)
+# Overlapping master runs: one every 15 minutes while DAGs are being waited on.
+MAX_ACTIVE_RUNS = 32
 
 # Iceberg uses optimistic concurrency: parallel UPDATEs on the same table can
 # fail with a commit conflict, so Impala statements are retried with backoff.
@@ -257,20 +265,29 @@ def update_status(
     logger.info("%s: %s -> %s (%s)", dag_name, "/".join(from_statuses), status, run_date)
 
 
+class ChildRunAlreadyExists(AirflowException):
+    """The child run id is taken: another master run triggered this DAG."""
+
+
+class ChildRunTimeout(AirflowException):
+    """The child run did not finish in time; it may still be running."""
+
+
 def child_run_id_prefix(run_date: str) -> str:
     return f"{CHILD_RUN_ID_PREFIX}__{run_date}__"
 
 
-def build_child_run_id(run_date: str, parent_run_id: str) -> str:
-    """Unique per master run, so a retried task re-attaches to the same child run."""
-    return f"{child_run_id_prefix(run_date)}{parent_run_id}"
+def build_child_run_id(run_date: str, attempt: int) -> str:
+    """``upstream__<run_date>__<n>``: the n-th run of a DAG for that day. The
+    unique (dag_id, run_id) key stops two master runs triggering it twice."""
+    return f"{child_run_id_prefix(run_date)}{attempt}"
 
 
 def trigger_child_dag(dag_id: str, run_id: str, conf: dict | None = None) -> str:
-    """Trigger ``dag_id`` without waiting for it; returns the run_id.
+    """Trigger ``dag_id`` with ``run_id`` and return the run_id.
 
-    Raises if the DAG does not exist or is paused. An existing run with the same
-    run_id (task retry) is reused instead of creating a new one.
+    Raises ChildRunAlreadyExists if ``run_id`` exists, AirflowException if the
+    DAG does not exist or is paused.
     """
     from airflow.api.common.trigger_dag import trigger_dag
     from airflow.exceptions import DagRunAlreadyExists
@@ -281,36 +298,72 @@ def trigger_child_dag(dag_id: str, run_id: str, conf: dict | None = None) -> str
         raise AirflowException(f"DAG {dag_id!r} does not exist")
     if dag_model.is_paused:
         raise AirflowException(f"DAG {dag_id!r} is paused")
-
     if DagRun.find(dag_id=dag_id, run_id=run_id):
-        logger.info("DAG run %s.%s already exists; re-using it", dag_id, run_id)
-        return run_id
+        raise ChildRunAlreadyExists(f"DAG run {dag_id}.{run_id} already exists")
     try:
         dag_run = trigger_dag(dag_id=dag_id, run_id=run_id, conf=conf, replace_microseconds=False)
-    except DagRunAlreadyExists:
-        logger.info("DAG run %s.%s already exists; re-using it", dag_id, run_id)
-        return run_id
+    except DagRunAlreadyExists as exc:
+        raise ChildRunAlreadyExists(str(exc)) from exc
     if dag_run is None:
         raise AirflowException(f"Failed to trigger DAG {dag_id!r}")
     logger.info("Triggered %s with run_id=%s", dag_id, dag_run.run_id)
     return dag_run.run_id
 
 
-def find_latest_child_run(dag_id: str, run_date: str) -> tuple[str, str] | None:
-    """``(run_id, state)`` of the newest run of ``dag_id`` triggered for ``run_date``."""
+@dataclass(frozen=True)
+class ChildRun:
+    run_id: str
+    state: str
+    parent_run_id: str | None
+
+
+def list_child_runs(dag_id: str, run_date: str) -> list[ChildRun]:
+    """Runs of ``dag_id`` triggered by this DAG for ``run_date``, newest first."""
     from airflow.models import DagRun
     from airflow.utils.session import create_session
 
     prefix = child_run_id_prefix(run_date)
     escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     with create_session() as session:
-        dag_run = (
+        runs = (
             session.query(DagRun)
             .filter(DagRun.dag_id == dag_id, DagRun.run_id.like(f"{escaped}%", escape="\\"))
             .order_by(DagRun.execution_date.desc())
-            .first()
+            .all()
         )
-        return (dag_run.run_id, dag_run.state) if dag_run else None
+        return [ChildRun(r.run_id, r.state, (r.conf or {}).get("parent_run_id")) for r in runs]
+
+
+def find_latest_child_run(dag_id: str, run_date: str) -> tuple[str, str] | None:
+    """``(run_id, state)`` of the newest run of ``dag_id`` triggered for ``run_date``."""
+    runs = list_child_runs(dag_id, run_date)
+    return (runs[0].run_id, runs[0].state) if runs else None
+
+
+def wait_for_dag_run(
+    dag_id: str,
+    run_id: str,
+    poke_interval: float = CHILD_POKE_INTERVAL.total_seconds(),
+    timeout: float = CHILD_DAG_TIMEOUT.total_seconds(),
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> str:
+    """Block until the DAG run is success/failed and return that state."""
+    from airflow.models import DagRun
+
+    deadline = clock() + timeout
+    while True:
+        runs = DagRun.find(dag_id=dag_id, run_id=run_id)
+        if not runs:
+            raise AirflowException(f"DAG run {dag_id}.{run_id} not found")
+        state = runs[0].state
+        if state in (DagRunState.SUCCESS, DagRunState.FAILED):
+            logger.info("DAG run %s.%s finished: %s", dag_id, run_id, state)
+            return DagRunState(state).value
+        if clock() >= deadline:
+            raise ChildRunTimeout(f"{dag_id}.{run_id} still {state} after {timeout:.0f}s")
+        logger.info("DAG run %s.%s is %s; checking again in %.0fs", dag_id, run_id, state, poke_interval)
+        sleep(poke_interval)
 
 
 def reconcile_triggered_dags(
@@ -335,7 +388,6 @@ def reconcile_triggered_dags(
                     logger.error("DAG %s run %s failed", dag_name, run_id)
                     new_status = STATUS_FAILED
                 else:
-                    logger.info("DAG %s run %s is still %s", dag_name, run_id, run_state)
                     summary["running"].append(dag_name)
                     continue
             update_status(hook, dag_name=dag_name, run_date=run_date, status=new_status,
@@ -352,7 +404,13 @@ def reconcile_triggered_dags(
     return summary
 
 
-def trigger_upstream(
+def _mark_final(hook: Any, dag_name: str, run_date: str, status: str) -> None:
+    # READY too: the DAG ran even if marking it TRIGGERED failed earlier.
+    update_status(hook, dag_name=dag_name, run_date=run_date, status=status,
+                  from_statuses=[STATUS_READY, STATUS_TRIGGERED])
+
+
+def trigger_and_wait(
     *,
     dag_name: str,
     run_date: str,
@@ -360,26 +418,68 @@ def trigger_upstream(
     parent_run_id: str,
     hook: Any,
     trigger: Callable[..., str] | None = None,
+    wait: Callable[..., str] | None = None,
+    list_runs: Callable[..., list[ChildRun]] | None = None,
 ) -> str:
-    """Trigger one upstream DAG and mark it TRIGGERED; mark FAILED if that fails."""
+    """Trigger one upstream DAG, wait for it and keep its log rows in sync.
+
+    Returns the final state ("success"), or "skipped" when another master run
+    already owns today's run of this DAG. Raises when the DAG fails.
+    """
     trigger = trigger or trigger_child_dag
+    wait = wait or wait_for_dag_run
+    list_runs = list_runs or list_child_runs
+
+    # 1. Find or create today's run of the DAG.
+    existing = list_runs(dag_name, run_date)
+    mine = [r for r in existing if r.parent_run_id == parent_run_id]
+    if mine:
+        run_id = mine[0].run_id  # this task is being retried
+        logger.info("Re-attaching to %s.%s", dag_name, run_id)
+    elif any(r.state not in (DagRunState.SUCCESS, DagRunState.FAILED) for r in existing):
+        logger.info("%s already has an active run for %s from another master run; skipping", dag_name, run_date)
+        return "skipped"
+    elif dag_name not in fetch_day_state(hook, run_date).ready:
+        # This task waited for a free slot and meanwhile another master run handled the DAG.
+        logger.info("%s is no longer %s for %s; skipping", dag_name, STATUS_READY, run_date)
+        return "skipped"
+    else:
+        run_id = None
     try:
-        run_id = trigger(
-            dag_name,
-            build_child_run_id(run_date, parent_run_id),
-            conf={"run_date": run_date, "parent_dag_id": parent_dag_id, "parent_run_id": parent_run_id},
-        )
-        update_status(hook, dag_name=dag_name, run_date=run_date, status=STATUS_TRIGGERED,
-                      from_statuses=[STATUS_READY], set_triggered_ts=True)
-        return run_id
+        if run_id is None:
+            run_id = trigger(
+                dag_name,
+                build_child_run_id(run_date, len(existing) + 1),
+                conf={"run_date": run_date, "parent_dag_id": parent_dag_id, "parent_run_id": parent_run_id},
+            )
+    except ChildRunAlreadyExists:
+        logger.info("%s was just triggered by another master run; skipping", dag_name)
+        return "skipped"
     except Exception as exc:
         logger.error("Could not trigger %s: %s", dag_name, exc)
         try:
-            update_status(hook, dag_name=dag_name, run_date=run_date, status=STATUS_FAILED,
-                          from_statuses=[STATUS_READY, STATUS_TRIGGERED])
+            _mark_final(hook, dag_name, run_date, STATUS_FAILED)
         except Exception:
             logger.exception("Could not mark %s as %s", dag_name, STATUS_FAILED)
         raise
+
+    # 2. Mark it TRIGGERED. If that fails keep going: the final update fixes the row.
+    try:
+        update_status(hook, dag_name=dag_name, run_date=run_date, status=STATUS_TRIGGERED,
+                      from_statuses=[STATUS_READY], set_triggered_ts=True)
+    except Exception:
+        logger.exception("Could not mark %s as %s; continuing", dag_name, STATUS_TRIGGERED)
+
+    # 3. Wait for it. A timeout or kill leaves the row TRIGGERED; a later run's
+    #    reconcile_triggered step sets the final status when the DAG finishes.
+    state = wait(dag_name, run_id)
+
+    # 4. Final status.
+    if state == DagRunState.SUCCESS.value:
+        _mark_final(hook, dag_name, run_date, STATUS_SUCCEEDED)
+        return state
+    _mark_final(hook, dag_name, run_date, STATUS_FAILED)
+    raise AirflowException(f"DAG {dag_name} run {run_id} finished as {state}")
 
 
 def validate_edw_connection_config(conn: Any) -> None:
@@ -409,18 +509,18 @@ with DAG(
     schedule=SCHEDULE,
     start_date=pendulum.datetime(2026, 10, 6, tz=LOCAL_TZ),
     catchup=False,
-    # One run at a time: runs never overlap on the log table.
-    max_active_runs=1,
+    max_active_runs=MAX_ACTIVE_RUNS,
     dagrun_timeout=DAGRUN_TIMEOUT,
     tags=["test", "dev", "spark", "impala", "iceberg"],
 ) as dag:
     start = EmptyOperator(task_id="start")
 
-    @task
+    # max_active_tis_per_dag=1: these steps never run in two master runs at once.
+    @task(max_active_tis_per_dag=1)
     def reconcile_triggered(run_date: str) -> dict[str, list[str]]:
         return reconcile_triggered_dags(get_impala_hook(), run_date, exclude=[DAG_ID])
 
-    @task.short_circuit
+    @task.short_circuit(max_active_tis_per_dag=1)
     def check_day_pending(run_date: str) -> bool:
         expected = get_expected_dag_count()
         state = fetch_day_state(get_impala_hook(), run_date, exclude=[DAG_ID])
@@ -444,6 +544,7 @@ with DAG(
         connection_id=CDE_CONN_ID,
         timeout=CDE_JOB_TIMEOUT_SECONDS,
         execution_timeout=timedelta(seconds=CDE_JOB_TIMEOUT_SECONDS + 300),
+        max_active_tis_per_dag=1,
         overrides={
             "spark": {
                 "conf": {
@@ -456,7 +557,7 @@ with DAG(
         },
     )
 
-    @task
+    @task(max_active_tis_per_dag=1)
     def get_dags_to_trigger(run_date: str) -> list[str]:
         state = fetch_day_state(get_impala_hook(), run_date, exclude=[DAG_ID])
         to_trigger = select_dags_to_trigger(state)
@@ -466,9 +567,13 @@ with DAG(
         )
         return to_trigger
 
-    @task(max_active_tis_per_dagrun=MAX_PARALLEL_DAGS)
+    # max_active_tis_per_dag caps running child DAGs at 6 across ALL master runs.
+    @task(
+        max_active_tis_per_dag=MAX_PARALLEL_DAGS,
+        execution_timeout=CHILD_DAG_TIMEOUT + timedelta(minutes=15),
+    )
     def trigger_upstream_dag(dag_name: str, run_date: str, **context) -> str:
-        return trigger_upstream(
+        return trigger_and_wait(
             dag_name=dag_name,
             run_date=run_date,
             parent_dag_id=context["dag"].dag_id,
@@ -482,7 +587,8 @@ with DAG(
     to_trigger = get_dags_to_trigger(run_date=RUN_DATE_TEMPLATE)
     triggered = trigger_upstream_dag.partial(run_date=RUN_DATE_TEMPLATE).expand(dag_name=to_trigger)
 
-    # NONE_FAILED: succeeds when nothing had to be triggered.
+    # NONE_FAILED: succeeds when every DAG succeeded or nothing had to run;
+    # fails when any DAG failed.
     end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.NONE_FAILED)
 
     start >> reconciled >> pending >> validated >> check_ready_list >> to_trigger >> triggered >> end
