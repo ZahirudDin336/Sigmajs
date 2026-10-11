@@ -1,157 +1,164 @@
 """
 CDE Spark job ``test_check_ready_list``.
 
-Reads the list of DAGs that are ready from the source (EDW over JDBC) and
-inserts a ``READY`` row into the Iceberg table ``dev_stg.upstream_trigger_log``
-for every DAG that has no row yet for the run date. Existing rows (whatever
-their status) are never touched, so the job is safe to re-run.
+Reads today's dataset load log from the EDW (Oracle), stages it in
+``dev_stg.tmp_upstream_list_dly`` and inserts one ``READY`` row per new
+(dataset, table) into ``dev_stg.upstream_trigger_log``. Rows already present for
+today are never inserted again, so the job can run every 15 minutes.
 
-Spark conf (passed by the Airflow DAG through CDE overrides):
-    spark.edw_jdbc_url   JDBC URL of the source
-    spark.edw_username   source user
-    spark.edw_password   source password (redacted in the Spark UI)
-    spark.source_query   SQL returning a ``dag_name`` column; ``{curr_date}``
-                         is replaced with the run date
-    spark.curr_date      run date, YYYY-MM-DD
-    spark.target_table   optional, default dev_stg.upstream_trigger_log
-    spark.edw_driver     optional JDBC driver class
+Spark conf (passed by the Airflow DAG):
+    spark.edw_jdbc_url, spark.edw_username, spark.edw_password
 """
-from __future__ import annotations
-
-import logging
 import sys
-from dataclasses import dataclass
-from datetime import date
 
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
+from pyspark.sql import SparkSession
 
-logger = logging.getLogger("check_ready_list")
-
-DEFAULT_TARGET_TABLE = "dev_stg.upstream_trigger_log"
+APP_NAME = "test_upstream_dly"
+BD_test_upstream_dly = "dev_stg.tmp_upstream_list_dly"
+UPSTREAM_TRIGGER_LOG = "dev_stg.upstream_trigger_log"
 STATUS_READY = "READY"
-SOURCE_VIEW = "upstream_new_ready_dags"
+ORACLE_DRIVER = "oracle.jdbc.driver.OracleDriver"
+
+ready_list_query = """
+(	select
+	logs.DATASET_NAME,
+	logs.TABLENAME,
+	lists.AIRFLOW_DAG_NAME,
+	logs.STATUS,
+	logs.EXECUTION_DATE,
+	logs.INSERT_DT,
+	logs.INSERT_LOAD_ID
+	from
+	UP_EDW.HLP_ADS_DATASETS_LOG_TEST logs
+	LEFT JOIN UP_EDW.HLP_ADS_DATASETS lists
+	on lists.DATASET_NAME=logs.DATASET_NAME and lists.SOURCE_TABLENAME=logs.TABLENAME
+	and lists.STATUS='ACTIVE'
+	where logs.EXECUTION_DATE>=trunc(SYSDATE)
+) src
+"""
+
+# One READY row per (dataset, table) and day: the latest load of the source
+# wins, rows without a mapped DAG are skipped, rows already logged today are
+# skipped. triggered_ts stays NULL until the Airflow DAG triggers the DAG.
+INSERT_NEW_READY_SQL = f"""
+INSERT INTO {UPSTREAM_TRIGGER_LOG}
+(
+dataset_name,
+source_tablename,
+dag_name,
+status, target_table ,
+source_insert_dt,
+insert_load_id,
+triggered_ts ,
+updated_ts
+)
+SELECT
+o.dataset_name as dataset_name,
+o.tablename as source_tablename,
+o.airflow_dag_name as dag_name,
+'{STATUS_READY}' as status, null as target_table ,
+o.execution_date as source_insert_dt,
+cast(o.insert_load_id as int) as insert_load_id,
+NULL as triggered_ts,
+current_timestamp() AS updated_ts
+FROM (
+    SELECT s.*,
+           row_number() OVER (PARTITION BY s.dataset_name, s.tablename
+                              ORDER BY s.execution_date DESC, s.insert_load_id DESC) AS rn
+    FROM {BD_test_upstream_dly} s
+    WHERE s.airflow_dag_name IS NOT NULL
+) o
+LEFT JOIN (
+    SELECT DISTINCT dataset_name, source_tablename
+    FROM {UPSTREAM_TRIGGER_LOG}
+    WHERE source_insert_dt >= current_date()
+) l
+ON o.dataset_name = l.dataset_name
+and o.tablename = l.source_tablename
+where o.rn = 1
+and l.dataset_name IS NULL
+"""
 
 
-@dataclass(frozen=True)
-class JobConfig:
-    jdbc_url: str
-    username: str
-    password: str
-    source_query: str
-    curr_date: str
-    target_table: str = DEFAULT_TARGET_TABLE
-    driver: str | None = None
+def get_logger(spark_session):
+    log4j = spark_session._jvm.org.apache.log4j
+    return log4j.LogManager.getLogger(__name__)
 
 
-def parse_config(conf: dict[str, str]) -> JobConfig:
-    """Validate the ``spark.*`` settings and build a :class:`JobConfig`."""
-    required = {
-        "jdbc_url": "spark.edw_jdbc_url",
-        "username": "spark.edw_username",
-        "password": "spark.edw_password",
-        "source_query": "spark.source_query",
-        "curr_date": "spark.curr_date",
-    }
-    values = {field: (conf.get(key) or "").strip() for field, key in required.items()}
-    missing = [required[field] for field, value in values.items() if not value]
+def build_spark_session():
+    return (
+        SparkSession.builder.appName(APP_NAME)
+        .config("spark.executor.memory", "10g")
+        .config("spark.driver.memory", "10g")
+        .config("spark.dynamicAllocation.maxExecutors", "5")
+        .config("spark.executor.cores", "5")
+        .config("spark.cores.max", "5")
+        .config("spark.yarn.executor.memoryOverhead", "8g")
+        .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
+        .config("spark.serializer", "org.apache.spark.serializer.JavaSerializer")
+        .config("spark.sql.legacy.allowUntypedScalaUDF", "true")
+        .config("mapreduce.input.fileinputformat.input.dir.recursive", "true")
+        .config("spark.jars", "/app/mount/common/ojdbc8.jar")
+        # Impala creates Iceberg TIMESTAMP columns "without time zone";
+        # Spark < 3.4 can only read/write them with this flag.
+        .config("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
+        .enableHiveSupport()
+        .getOrCreate()
+    )
+
+
+def get_edw_config(spark_session):
+    keys = ("spark.edw_jdbc_url", "spark.edw_username", "spark.edw_password")
+    values = {key: (spark_session.conf.get(key, "") or "").strip() for key in keys}
+    missing = [key for key, value in values.items() if not value]
     if missing:
         raise ValueError(f"Missing required Spark conf: {', '.join(missing)}")
+    return values["spark.edw_jdbc_url"], values["spark.edw_username"], values["spark.edw_password"]
+
+
+def etl(spark_session=None, source_query=ready_list_query, driver=ORACLE_DRIVER):
+    own_session = spark_session is None
+    logger = None
     try:
-        date.fromisoformat(values["curr_date"])
-    except ValueError as exc:
-        raise ValueError(f"spark.curr_date must be YYYY-MM-DD, got {values['curr_date']!r}") from exc
+        if own_session:
+            spark_session = build_spark_session()
 
-    return JobConfig(
-        **values,
-        target_table=(conf.get("spark.target_table") or DEFAULT_TARGET_TABLE).strip(),
-        driver=(conf.get("spark.edw_driver") or "").strip() or None,
-    )
+        logger = get_logger(spark_session)
+        spark_session.sql("SET hive.exec.dynamic.partition.mode = nonstrict")
+        spark_session.sql("SET hive.exec.dynamic.partition = true")
 
+        logger.info(f"Starting application: '{APP_NAME}'")
 
-def render_source_query(source_query: str, curr_date: str) -> str:
-    return source_query.replace("{curr_date}", curr_date).strip().rstrip(";")
+        edw_jdbc_url, edw_username, edw_password = get_edw_config(spark_session)
 
+        df_list = spark_session.read.jdbc(
+            edw_jdbc_url, source_query,
+            properties={"user": edw_username, "password": edw_password, "driver": driver},
+        )
+        df_list.createOrReplaceTempView("test_upstream_dly")
 
-def read_source(spark: SparkSession, cfg: JobConfig) -> DataFrame:
-    reader = (
-        spark.read.format("jdbc")
-        .option("url", cfg.jdbc_url)
-        .option("user", cfg.username)
-        .option("password", cfg.password)
-        .option("query", render_source_query(cfg.source_query, cfg.curr_date))
-    )
-    if cfg.driver:
-        reader = reader.option("driver", cfg.driver)
-    return reader.load()
+        spark_session.sql(f"DROP TABLE IF EXISTS {BD_test_upstream_dly}")
+        spark_session.sql(f""" CREATE TABLE {BD_test_upstream_dly} STORED AS PARQUET AS
+                                SELECT * FROM test_upstream_dly """)
+        logger.info(f"Data successfully written to table '{BD_test_upstream_dly}'")
 
+        spark_session.sql(INSERT_NEW_READY_SQL)
+        logger.info(f"Data successfully written to table {UPSTREAM_TRIGGER_LOG}")
 
-def build_ready_entries(source_df: DataFrame, curr_date: str) -> DataFrame:
-    """Normalise the source list into distinct ``(dag_name, run_date, status)`` rows."""
-    columns = {c.lower(): c for c in source_df.columns}
-    if "dag_name" not in columns:
-        raise ValueError(f"Source query must return a dag_name column, got {source_df.columns}")
-    return (
-        source_df.select(F.trim(F.col(columns["dag_name"]).cast("string")).alias("dag_name"))
-        .where(F.col("dag_name").isNotNull() & (F.col("dag_name") != ""))
-        .distinct()
-        .withColumn("run_date", F.to_date(F.lit(curr_date)))
-        .withColumn("status", F.lit(STATUS_READY))
-    )
-
-
-def filter_new_entries(entries_df: DataFrame, existing_df: DataFrame, curr_date: str) -> DataFrame:
-    """Drop the DAGs that already have a row for ``curr_date``."""
-    existing = existing_df.where(F.col("run_date") == F.to_date(F.lit(curr_date))).select("dag_name")
-    return entries_df.join(existing, on="dag_name", how="left_anti")
-
-
-def merge_new_entries(spark: SparkSession, new_df: DataFrame, target_table: str) -> None:
-    """Insert ``new_df`` atomically; MERGE keeps it idempotent if rows appeared meanwhile."""
-    new_df.createOrReplaceTempView(SOURCE_VIEW)
-    spark.sql(
-        f"""
-        MERGE INTO {target_table} t
-        USING {SOURCE_VIEW} s
-        ON t.dag_name = s.dag_name AND t.run_date = s.run_date
-        WHEN NOT MATCHED THEN INSERT (dag_name, run_date, status, created_ts, updated_ts)
-        VALUES (s.dag_name, s.run_date, s.status, current_timestamp(), current_timestamp())
-        """
-    )
-
-
-def run(spark: SparkSession, cfg: JobConfig, source_df: DataFrame | None = None) -> int:
-    """Run the job and return the number of new READY rows inserted."""
-    if source_df is None:
-        source_df = read_source(spark, cfg)
-
-    entries = build_ready_entries(source_df, cfg.curr_date)
-    new_entries = filter_new_entries(entries, spark.table(cfg.target_table), cfg.curr_date).cache()
-    try:
-        new_count = new_entries.count()
-        logger.info("%s new DAG(s) to insert for %s", new_count, cfg.curr_date)
-        if new_count:
-            merge_new_entries(spark, new_entries, cfg.target_table)
-        return new_count
+    except Exception as err:
+        if logger:
+            logger.error("An error occured during application execution")
+            logger.error(f"Error Type: {type(err).__name__}")
+            logger.error(f"Error Message: {str(err)}")
+        else:
+            print(f"Application failed (before logger initialization): {str(err)}", file=sys.stderr)
+        raise
     finally:
-        new_entries.unpersist()
-
-
-def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    spark = SparkSession.builder.appName("test_check_ready_list").getOrCreate()
-    # Impala creates Iceberg TIMESTAMP columns as "timestamp without time zone";
-    # older Spark/Iceberg versions need this to write them.
-    spark.conf.set("spark.sql.iceberg.handle-timestamp-without-timezone", "true")
-    try:
-        cfg = parse_config(dict(spark.sparkContext.getConf().getAll()))
-        logger.info("Loading READY DAGs for %s into %s", cfg.curr_date, cfg.target_table)
-        inserted = run(spark, cfg)
-        logger.info("Inserted %s new READY row(s) into %s", inserted, cfg.target_table)
-        return 0
-    finally:
-        spark.stop()
+        if own_session and spark_session:
+            spark_session.stop()
+            if logger:
+                logger.info("Spark Session stopped")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    etl()

@@ -1,18 +1,11 @@
-"""Tests for the CDE Spark job, run on local Spark with a real Iceberg catalog.
+"""Tests for the CDE Spark job, on local Spark with a Hive metastore.
 
-The Iceberg Spark runtime jar is taken from $ICEBERG_SPARK_JAR or downloaded
-once from Maven Central into ~/.cache. The EDW source is emulated with an
-Apache Derby database through Spark's JDBC reader (Derby ships with Spark).
+The EDW (Oracle) source is emulated with an Apache Derby database read through
+Spark's JDBC reader (Derby ships with Spark).
 """
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-import textwrap
-import urllib.request
-from datetime import date
-from pathlib import Path
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -20,272 +13,147 @@ pyspark = pytest.importorskip("pyspark")
 import check_ready_list as job  # noqa: E402
 from pyspark.sql import SparkSession  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
-ICEBERG_VERSION = "1.6.1"
-ICEBERG_ARTIFACT = f"iceberg-spark-runtime-3.5_2.12-{ICEBERG_VERSION}.jar"
-CURR_DATE = "2026-10-08"
-TABLE = "local.dev_stg.upstream_trigger_log"
-
-# Mirrors sql/upstream_trigger_log.sql: Impala TIMESTAMP is Iceberg
-# "timestamp without time zone", i.e. Spark TIMESTAMP_NTZ.
-CREATE_TABLE = f"""
-    CREATE TABLE {TABLE} (
-        dag_name STRING, run_date DATE, status STRING, dag_run_id STRING,
-        parent_dag_run_id STRING, error_message STRING, created_ts TIMESTAMP_NTZ,
-        triggered_ts TIMESTAMP_NTZ, completed_ts TIMESTAMP_NTZ, updated_ts TIMESTAMP_NTZ)
-    USING iceberg PARTITIONED BY (months(run_date))
-    TBLPROPERTIES ('format-version'='2', 'write.merge.mode'='merge-on-read')
-"""
-
-
-def iceberg_jar() -> str:
-    if os.environ.get("ICEBERG_SPARK_JAR"):
-        return os.environ["ICEBERG_SPARK_JAR"]
-    path = Path.home() / ".cache" / "iceberg" / ICEBERG_ARTIFACT
-    if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        url = (
-            "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/"
-            f"{ICEBERG_VERSION}/{ICEBERG_ARTIFACT}"
-        )
-        urllib.request.urlretrieve(url, path.with_suffix(".part"))
-        path.with_suffix(".part").rename(path)
-    return str(path)
-
-
-def spark_conf(warehouse: Path) -> dict[str, str]:
-    return {
-        "spark.master": "local[2]",
-        "spark.ui.enabled": "false",
-        "spark.sql.shuffle.partitions": "2",
-        "spark.jars": iceberg_jar(),
-        "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
-        "spark.sql.catalog.local": "org.apache.iceberg.spark.SparkCatalog",
-        "spark.sql.catalog.local.type": "hadoop",
-        "spark.sql.catalog.local.warehouse": str(warehouse),
-    }
+DERBY_URL = "jdbc:derby:memory:edw;create=true"
+DERBY_DRIVER = "org.apache.derby.jdbc.EmbeddedDriver"
+# Spark cannot write NULL strings to Derby, so "" stands for a missing DAG mapping.
+SOURCE_QUERY = (
+    "(SELECT DATASET_NAME, TABLENAME, NULLIF(AIRFLOW_DAG_NAME, '') AS AIRFLOW_DAG_NAME, STATUS, "
+    "EXECUTION_DATE, INSERT_DT, INSERT_LOAD_ID FROM SRC_LOG) src"
+)
+SOURCE_COLUMNS = (
+    "DATASET_NAME VARCHAR(64), TABLENAME VARCHAR(64), AIRFLOW_DAG_NAME VARCHAR(64), STATUS VARCHAR(16), "
+    "EXECUTION_DATE TIMESTAMP, INSERT_DT TIMESTAMP, INSERT_LOAD_ID INTEGER"
+)
+NOW = datetime.now().replace(microsecond=0)
+TODAY = NOW.replace(hour=0, minute=0, second=0)
+YESTERDAY = TODAY - timedelta(days=1)
 
 
 @pytest.fixture(scope="module")
-def warehouse(tmp_path_factory):
-    return tmp_path_factory.mktemp("warehouse")
-
-
-@pytest.fixture(scope="module")
-def spark(warehouse):
-    builder = SparkSession.builder.appName("test_check_ready_list")
-    for key, value in spark_conf(warehouse).items():
-        builder = builder.config(key, value)
-    session = builder.getOrCreate()
+def spark(tmp_path_factory):
+    base = tmp_path_factory.mktemp("hive")
+    session = (
+        SparkSession.builder.appName("test_check_ready_list")
+        .master("local[2]")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.sql.warehouse.dir", str(base / "warehouse"))
+        .config("spark.hadoop.javax.jdo.option.ConnectionURL",
+                f"jdbc:derby:;databaseName={base / 'metastore_db'};create=true")
+        .enableHiveSupport()
+        .getOrCreate()
+    )
+    session.sql("CREATE DATABASE IF NOT EXISTS dev_stg")
     yield session
     session.stop()
 
 
 @pytest.fixture
-def log_table(spark):
-    spark.sql(f"DROP TABLE IF EXISTS {TABLE}")
-    spark.sql(CREATE_TABLE)
-    yield TABLE
-    spark.sql(f"DROP TABLE IF EXISTS {TABLE}")
-
-
-def make_cfg(**overrides) -> job.JobConfig:
-    values = dict(jdbc_url="jdbc:x", username="u", password="p", source_query="SELECT 1",
-                  curr_date=CURR_DATE, target_table=TABLE)
-    values.update(overrides)
-    return job.JobConfig(**values)
-
-
-def rows(spark, table=TABLE):
-    return {
-        (r.dag_name, r.run_date.isoformat()): r
-        for r in spark.table(table).collect()
-    }
-
-
-# --------------------------------------------------------------------------- #
-# Config
-# --------------------------------------------------------------------------- #
-FULL_CONF = {
-    "spark.edw_jdbc_url": "jdbc:oracle:thin:@edw:1521/EDW",
-    "spark.edw_username": "user",
-    "spark.edw_password": "secret",
-    "spark.source_query": "SELECT dag_name FROM t WHERE d = '{curr_date}'",
-    "spark.curr_date": CURR_DATE,
-}
-
-
-def test_parse_config_defaults():
-    cfg = job.parse_config(FULL_CONF)
-    assert cfg.target_table == "dev_stg.upstream_trigger_log"
-    assert cfg.driver is None
-    assert cfg.curr_date == CURR_DATE
-
-
-def test_parse_config_overrides():
-    cfg = job.parse_config({**FULL_CONF, "spark.target_table": " a.b ", "spark.edw_driver": "oracle.jdbc.OracleDriver"})
-    assert cfg.target_table == "a.b"
-    assert cfg.driver == "oracle.jdbc.OracleDriver"
-
-
-@pytest.mark.parametrize("key", sorted(FULL_CONF))
-def test_parse_config_requires_every_setting(key):
-    conf = {**FULL_CONF, key: "  "}
-    with pytest.raises(ValueError, match=key):
-        job.parse_config(conf)
-
-
-@pytest.mark.parametrize("bad", ["08-10-2026", "2026-13-01", "{{ ds }}"])
-def test_parse_config_rejects_bad_date(bad):
-    with pytest.raises(ValueError, match="YYYY-MM-DD"):
-        job.parse_config({**FULL_CONF, "spark.curr_date": bad})
-
-
-def test_render_source_query():
-    assert job.render_source_query(" SELECT a FROM t WHERE d='{curr_date}'; ", CURR_DATE) == (
-        "SELECT a FROM t WHERE d='2026-10-08'"
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Transformations
-# --------------------------------------------------------------------------- #
-def test_build_ready_entries_normalises(spark):
-    src = spark.createDataFrame([(" dag_a ",), ("dag_a",), (None,), ("",), ("  ",), ("dag_b",)], "DAG_NAME string")
-    out = job.build_ready_entries(src, CURR_DATE)
-    assert out.columns == ["dag_name", "run_date", "status"]
-    assert sorted((r.dag_name, r.run_date, r.status) for r in out.collect()) == [
-        ("dag_a", date(2026, 10, 8), "READY"),
-        ("dag_b", date(2026, 10, 8), "READY"),
-    ]
-
-
-def test_build_ready_entries_requires_dag_name(spark):
-    with pytest.raises(ValueError, match="dag_name"):
-        job.build_ready_entries(spark.createDataFrame([("x",)], "name string"), CURR_DATE)
-
-
-def test_filter_new_entries_only_same_run_date(spark):
-    entries = job.build_ready_entries(spark.createDataFrame([("a",), ("b",), ("c",)], "dag_name string"), CURR_DATE)
-    existing = spark.createDataFrame(
-        [("a", date(2026, 10, 8)), ("b", date(2026, 10, 7))], "dag_name string, run_date date"
-    )
-    assert sorted(r.dag_name for r in job.filter_new_entries(entries, existing, CURR_DATE).collect()) == ["b", "c"]
-
-
-# --------------------------------------------------------------------------- #
-# run() against a real Iceberg table
-# --------------------------------------------------------------------------- #
-def test_run_inserts_only_new_ready_rows(spark, log_table):
+def tables(spark):
+    spark.sql(f"DROP TABLE IF EXISTS {job.UPSTREAM_TRIGGER_LOG}")
+    spark.sql(f"DROP TABLE IF EXISTS {job.BD_test_upstream_dly}")
     spark.sql(f"""
-        INSERT INTO {log_table} VALUES
-        ('dag_a', DATE'{CURR_DATE}', 'TRIGGERED', 'run_1', 'p1', NULL,
-         TIMESTAMP_NTZ'2026-10-08 01:00:00', TIMESTAMP_NTZ'2026-10-08 02:00:00', NULL, NULL),
-        ('dag_b', DATE'2026-10-07', 'FAILED', 'run_0', 'p0', 'boom',
-         TIMESTAMP_NTZ'2026-10-07 01:00:00', NULL, TIMESTAMP_NTZ'2026-10-07 03:00:00', NULL)
+        CREATE TABLE {job.UPSTREAM_TRIGGER_LOG} (
+            dataset_name STRING, source_tablename STRING, dag_name STRING, status STRING,
+            target_table STRING, source_insert_dt TIMESTAMP, insert_load_id INT,
+            triggered_ts TIMESTAMP, updated_ts TIMESTAMP)
+        STORED AS PARQUET
     """)
-    src = spark.createDataFrame([("dag_a",), ("dag_b",), ("dag_c",), (" dag_c",), (None,)], "dag_name string")
-
-    assert job.run(spark, make_cfg(), source_df=src) == 2
-
-    result = rows(spark, log_table)
-    assert set(result) == {("dag_a", CURR_DATE), ("dag_b", "2026-10-07"), ("dag_b", CURR_DATE), ("dag_c", CURR_DATE)}
-    assert result[("dag_a", CURR_DATE)].status == "TRIGGERED"  # existing row untouched
-    assert result[("dag_a", CURR_DATE)].dag_run_id == "run_1"
-    assert result[("dag_b", "2026-10-07")].status == "FAILED"
-    for key in [("dag_b", CURR_DATE), ("dag_c", CURR_DATE)]:
-        row = result[key]
-        assert row.status == "READY"
-        assert row.created_ts is not None and row.updated_ts is not None
-        assert row.dag_run_id is None and row.triggered_ts is None
-
-    # Re-running for the same date is a no-op.
-    assert job.run(spark, make_cfg(), source_df=src) == 0
-    assert spark.table(log_table).count() == 4
+    spark.conf.set("spark.edw_jdbc_url", DERBY_URL)
+    spark.conf.set("spark.edw_username", "app")
+    spark.conf.set("spark.edw_password", "app")
+    yield
+    for key in ("spark.edw_jdbc_url", "spark.edw_username", "spark.edw_password"):
+        spark.conf.unset(key)
 
 
-def test_run_with_empty_source(spark, log_table):
-    src = spark.createDataFrame([], "dag_name string")
-    assert job.run(spark, make_cfg(), source_df=src) == 0
-    assert spark.table(log_table).count() == 0
+def write_source(spark, rows):
+    df = spark.createDataFrame(
+        rows,
+        "DATASET_NAME string, TABLENAME string, AIRFLOW_DAG_NAME string, STATUS string, "
+        "EXECUTION_DATE timestamp, INSERT_DT timestamp, INSERT_LOAD_ID int",
+    )
+    (df.write.option("createTableColumnTypes", SOURCE_COLUMNS)
+       .jdbc(DERBY_URL, "SRC_LOG", mode="overwrite"))
 
 
-def test_read_source_over_jdbc(spark):
-    url = "jdbc:derby:memory:edw_read;create=true"
-    spark.createDataFrame(
-        [("dag_a", "2026-10-08"), ("dag_b", "2026-10-07")], "DAG_NAME string, LOAD_DATE string"
-    ).write.option("createTableColumnTypes", "DAG_NAME VARCHAR(128), LOAD_DATE VARCHAR(10)").jdbc(
-        url, "SRC_DAGS", mode="overwrite")
-
-    cfg = make_cfg(jdbc_url=url, username="app", password="app",
-                   source_query="SELECT DAG_NAME FROM SRC_DAGS WHERE LOAD_DATE = '{curr_date}';",
-                   driver="org.apache.derby.jdbc.EmbeddedDriver")
-    assert [r[0] for r in job.read_source(spark, cfg).collect()] == ["dag_a"]
+def add_log_row(spark, dataset, table, dag, status, ts):
+    spark.sql(f"""
+        INSERT INTO {job.UPSTREAM_TRIGGER_LOG} VALUES
+        ('{dataset}', '{table}', '{dag}', '{status}', NULL, TIMESTAMP'{ts}', 1, NULL, NULL)
+    """)
 
 
-# --------------------------------------------------------------------------- #
-# main(): the job exactly as CDE runs it, in its own Spark application
-# --------------------------------------------------------------------------- #
-def _spark_python(code: str, env: dict) -> None:
-    result = subprocess.run([sys.executable, "-c", textwrap.dedent(code)], env=env,
-                            capture_output=True, text=True, timeout=300)
-    assert result.returncode == 0, result.stderr[-4000:]
+def log_rows(spark):
+    return sorted(spark.table(job.UPSTREAM_TRIGGER_LOG).collect(),
+                  key=lambda r: (r.dataset_name, r.source_insert_dt))
 
 
-def _submit_args(conf: dict[str, str]) -> str:
-    import shlex
-    return " ".join(f"--conf {shlex.quote(f'{k}={v}')}" for k, v in conf.items()) + " pyspark-shell"
+def run_job(spark):
+    job.etl(spark_session=spark, source_query=SOURCE_QUERY, driver=DERBY_DRIVER)
 
 
-def test_main_end_to_end(tmp_path):
-    warehouse = tmp_path / "warehouse"
-    derby_url = f"jdbc:derby:{tmp_path / 'edw'};create=true"
-    base_conf = spark_conf(warehouse)
-    env = {**os.environ, "PYSPARK_SUBMIT_ARGS": _submit_args(base_conf)}
+def test_inserts_one_ready_row_per_new_dataset(spark, tables):
+    write_source(spark, [
+        ("ds1", "t1", "dag_a", "SUCCESS", TODAY + timedelta(hours=1), NOW, 1),
+        ("ds1", "t1", "dag_a", "SUCCESS", TODAY + timedelta(hours=2), NOW, 2),   # latest load wins
+        ("ds2", "t2", "", "SUCCESS", TODAY + timedelta(hours=1), NOW, 3),      # no DAG mapped
+        ("ds3", "t3", "dag_b", "SUCCESS", TODAY + timedelta(hours=1), NOW, 4),
+        ("ds4", "t4", "dag_c", "SUCCESS", TODAY + timedelta(hours=1), NOW, 5),   # already logged today
+    ])
+    add_log_row(spark, "ds4", "t4", "dag_c", "TRIGGERED", TODAY + timedelta(minutes=5))
+    add_log_row(spark, "ds3", "t3", "dag_b", "SUCCEEDED", YESTERDAY + timedelta(hours=1))
 
-    # Seed the source database and the (empty) target table.
-    _spark_python(f"""
-        import os
-        from pyspark.sql import SparkSession
-        spark = SparkSession.builder.getOrCreate()
-        src = spark.createDataFrame(
-            [("dag_a", "{CURR_DATE}"), ("dag_b", "{CURR_DATE}"), ("dag_x", "2026-10-07")],
-            "DAG_NAME string, LOAD_DATE string")
-        (src.write.option("createTableColumnTypes", "DAG_NAME VARCHAR(128), LOAD_DATE VARCHAR(10)")
-            .jdbc("{derby_url}", "SRC_DAGS"))
-        spark.sql(os.environ["CREATE_TABLE_SQL"])
-        spark.stop()
-    """, {**env, "CREATE_TABLE_SQL": CREATE_TABLE})
+    run_job(spark)
 
-    job_conf = {
-        **base_conf,
-        "spark.edw_jdbc_url": derby_url,
-        "spark.edw_username": "app",
-        "spark.edw_password": "app",
-        "spark.edw_driver": "org.apache.derby.jdbc.EmbeddedDriver",
-        "spark.source_query": "SELECT DAG_NAME FROM SRC_DAGS WHERE LOAD_DATE = '{curr_date}'",
-        "spark.curr_date": CURR_DATE,
-        "spark.target_table": TABLE,
-    }
-    result = subprocess.run([sys.executable, str(ROOT / "spark" / "check_ready_list.py")],
-                            env={**os.environ, "PYSPARK_SUBMIT_ARGS": _submit_args(job_conf)},
-                            capture_output=True, text=True, timeout=300)
-    assert result.returncode == 0, result.stderr[-4000:]
-    assert "Inserted 2 new READY row(s)" in result.stderr
-
-    _spark_python(f"""
-        from pyspark.sql import SparkSession
-        spark = SparkSession.builder.getOrCreate()
-        got = sorted((r.dag_name, str(r.run_date), r.status) for r in spark.table("{TABLE}").collect())
-        assert got == [("dag_a", "{CURR_DATE}", "READY"), ("dag_b", "{CURR_DATE}", "READY")], got
-        spark.stop()
-    """, env)
+    rows = log_rows(spark)
+    new = [r for r in rows if r.status == "READY"]
+    assert [(r.dataset_name, r.source_tablename, r.dag_name) for r in new] == [
+        ("ds1", "t1", "dag_a"), ("ds3", "t3", "dag_b")]
+    ds1 = new[0]
+    assert ds1.insert_load_id == 2
+    assert ds1.source_insert_dt == TODAY + timedelta(hours=2)
+    assert all(r.triggered_ts is None and r.updated_ts is not None and r.target_table is None for r in new)
+    # Existing rows untouched.
+    assert [(r.dataset_name, r.status) for r in rows if r.status != "READY"] == [
+        ("ds3", "SUCCEEDED"), ("ds4", "TRIGGERED")]
+    # Staging table holds the full source extract.
+    assert spark.table(job.BD_test_upstream_dly).count() == 5
 
 
-def test_main_fails_on_missing_conf(tmp_path):
-    conf = {**spark_conf(tmp_path / "warehouse"), "spark.curr_date": CURR_DATE}
-    result = subprocess.run([sys.executable, str(ROOT / "spark" / "check_ready_list.py")],
-                            env={**os.environ, "PYSPARK_SUBMIT_ARGS": _submit_args(conf)},
-                            capture_output=True, text=True, timeout=300)
-    assert result.returncode != 0
-    assert "Missing required Spark conf: spark.edw_jdbc_url" in result.stderr
+def test_rerun_every_15_minutes_inserts_nothing_new(spark, tables):
+    write_source(spark, [("ds1", "t1", "dag_a", "SUCCESS", TODAY + timedelta(hours=1), NOW, 1)])
+    run_job(spark)
+    run_job(spark)
+    assert len(log_rows(spark)) == 1
+
+    # A new dataset appears in the source later in the day.
+    write_source(spark, [("ds1", "t1", "dag_a", "SUCCESS", TODAY + timedelta(hours=1), NOW, 1),
+                         ("ds9", "t9", "dag_z", "SUCCESS", TODAY + timedelta(hours=3), NOW, 2)])
+    run_job(spark)
+    assert [(r.dataset_name, r.status) for r in log_rows(spark)] == [("ds1", "READY"), ("ds9", "READY")]
+
+
+def test_empty_source(spark, tables):
+    write_source(spark, [])
+    run_job(spark)
+    assert log_rows(spark) == []
+
+
+@pytest.mark.parametrize("key", ["spark.edw_jdbc_url", "spark.edw_username", "spark.edw_password"])
+def test_missing_conf_fails_before_any_write(spark, tables, key):
+    spark.conf.unset(key)
+    with pytest.raises(ValueError, match=key):
+        run_job(spark)
+    assert not spark.catalog.tableExists(job.BD_test_upstream_dly)
+
+
+def test_source_error_is_raised(spark, tables):
+    with pytest.raises(Exception, match="NO_SUCH_TABLE|does not exist"):
+        job.etl(spark_session=spark, source_query="(SELECT * FROM NO_SUCH_TABLE) src", driver=DERBY_DRIVER)
+
+
+def test_session_builder_sets_timestamp_flag():
+    import inspect
+
+    assert "spark.sql.iceberg.handle-timestamp-without-timezone" in inspect.getsource(job.build_spark_session)
