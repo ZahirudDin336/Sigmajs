@@ -18,6 +18,7 @@ def get_logger(spark_session):
 
 APP_NAME = "test_upstream_dly"
 BD_test_upstream_dly="dev_stg.tmp_upstream_list_dly"
+BD_upstream_trigger_log="dev_stg.upstream_trigger_log"
 
 
 ready_list_query = """
@@ -94,8 +95,8 @@ def etl():
         logger.info(f"Data successfully written to table '{BD_test_upstream_dly}'")
 
 #df_upstream = spark.sql("""SELECT * FROM  dev_stg.upstream_trigger_log""")
-        spark_session.sql("""
-        INSERT INTO dev_stg.upstream_trigger_log
+        spark_session.sql(f"""
+        INSERT INTO {BD_upstream_trigger_log}
         (
         dataset_name,
         source_tablename,
@@ -115,8 +116,8 @@ def etl():
         cast(o.insert_load_id as int) as insert_load_id,
         current_timestamp() as triggered_ts,
         NULL AS updated_ts
-        FROM dev_stg.tmp_upstream_list_dly o
-        LEFT JOIN  dev_stg.upstream_trigger_log l
+        FROM {BD_test_upstream_dly} o
+        LEFT JOIN  {BD_upstream_trigger_log} l
         ON o.dataset_name = l.dataset_name 
         and  o.tablename = l.source_tablename 
         and l.source_insert_dt >= current_date()
@@ -125,7 +126,7 @@ def etl():
         AND l.source_tablename IS NULL
         """)
 
-        logger.info(f"Data successfully written to table dev_stg.upstream_trigger_log")
+        logger.info(f"Data successfully written to table '{BD_upstream_trigger_log}'")
 
     except Exception as err:
         if logger:
