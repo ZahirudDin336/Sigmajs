@@ -45,7 +45,7 @@ from typing import Any
 import pendulum
 from airflow import DAG
 from airflow.decorators import task
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowFailException
 from airflow.hooks.base import BaseHook
 from airflow.operators.empty import EmptyOperator
 from airflow.providers.apache.impala.hooks.impala import ImpalaHook
@@ -145,6 +145,10 @@ def day_bounds(run_date: str) -> dict[str, str]:
     }
 
 
+class ImpalaPermissionError(AirflowFailException):
+    """The Impala user is not authorised; retrying cannot help."""
+
+
 def run_impala(
     hook: Any,
     sql: str,
@@ -164,7 +168,13 @@ def run_impala(
             if fetch:
                 return hook.get_records(sql, parameters=parameters) or []
             return hook.run(sql, parameters=parameters)
-        except Exception:
+        except Exception as exc:
+            if "AuthorizationException" in str(exc):
+                # A missing privilege never fixes itself: fail at once, no retries.
+                raise ImpalaPermissionError(
+                    f"Impala user of connection {IMPALA_CONN_ID!r} lacks privileges on {TRIGGER_LOG_TABLE} "
+                    f"(needs SELECT, REFRESH and UPDATE; grant them in Ranger). Impala said: {exc}"
+                ) from exc
             if attempt == attempts:
                 logger.exception("Impala statement failed after %s attempts", attempts)
                 raise

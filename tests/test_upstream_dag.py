@@ -254,6 +254,32 @@ def test_impala_gives_up_after_max_attempts():
     assert hook.status("dag_a") == m.STATUS_READY
 
 
+AUTH_ERROR = ("Query ca41a0f356623ce7:d2e2cb1d00000000 failed:\nAuthorizationException: User "
+              "'USER@INTERNAL.COMP.US' does not have privileges to access: dev_stg.upstream_trigger_log")
+
+
+def test_authorization_error_fails_at_once_without_retries():
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    hook.run = mock.Mock(side_effect=RuntimeError(AUTH_ERROR))
+    sleep = mock.Mock()
+    with pytest.raises(m.ImpalaPermissionError, match="lacks privileges on dev_stg.upstream_trigger_log"):
+        m.update_status(hook, dag_name="dag_a", run_date=RUN_DATE, status=m.STATUS_TRIGGERED,
+                        from_statuses=[m.STATUS_READY], insert_load_ids=[1], sleep=sleep)
+    hook.run.assert_called_once()
+    sleep.assert_not_called()
+
+
+def test_authorization_error_on_read_fails_before_anything_is_triggered(airflow_db, monkeypatch):
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    hook.run = mock.Mock(side_effect=RuntimeError(AUTH_ERROR))  # REFRESH / UPDATE refused
+    world = World(monkeypatch, hook)
+    dag_run, states = world.run("13:00")
+    assert states[("reconcile_triggered", -1)] == TaskInstanceState.FAILED
+    assert states[("trigger_upstream_dag", -1)] == TaskInstanceState.UPSTREAM_FAILED
+    assert world.triggered == []
+    assert world.cde_runs == 0
+
+
 def test_select_retries_too():
     hook = FakeImpalaHook.with_rows(row("dag_a"), fail_selects=1)
     with mock.patch.object(m.time, "sleep") as sleep:
