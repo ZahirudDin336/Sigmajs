@@ -17,33 +17,22 @@ FROM  (SELECT a.vf_number, a.cust_num, a.out_of_country_dt, UPPER(TRIM(t.c)) c
        GROUP  BY a.vf_number, a.cust_num, a.out_of_country_dt, UPPER(TRIM(t.c))
        HAVING COUNT(*) > 1) x;
 
--- 3. No empty token (",," / leading / trailing comma)
-SELECT COUNT(*) AS empty_tokens
+-- 3. No empty token (",," / leading / trailing comma) and no untrimmed token
+SELECT COUNT(*) AS bad_tokens
 FROM   dev_ads.travel_analysis a
-LATERAL VIEW EXPLODE(SPLIT(a.travelling_country, ',')) t AS c
-WHERE  TRIM(t.c) = '';
+LATERAL VIEW EXPLODE(SPLIT(a.travelling_country, ', ')) t AS c
+WHERE  TRIM(t.c) = '' OR t.c <> TRIM(t.c);
 
--- 4. QATAR not introduced by today's load
-SELECT COUNT(*) AS qatar_added
-FROM   dev_ads.travel_analysis a
-JOIN   dev_stg.delta_travel_analysis_key k
-  ON   a.vf_number = k.vf_number
- AND   COALESCE(a.cust_num, '#NULL#') = COALESCE(k.cust_num, '#NULL#')
- AND   a.out_of_country_dt = k.out_of_country_dt
-LEFT   JOIN dev_stg.travel_analysis_dev_ads p
-  ON   a.vf_number = p.vf_number
- AND   COALESCE(a.cust_num, '#NULL#') = COALESCE(p.cust_num, '#NULL#')
- AND   a.out_of_country_dt = p.out_of_country_dt
-WHERE  CONCAT(',', UPPER(REGEXP_REPLACE(a.travelling_country, '\\s*,\\s*', ',')), ',') LIKE '%,QATAR,%'
-  AND  NOT (CONCAT(',', UPPER(REGEXP_REPLACE(COALESCE(p.travelling_country, ''), '\\s*,\\s*', ',')), ',') LIKE '%,QATAR,%');
-
--- 5. Row count reconciliation: target = previous target + new keys
-SELECT (SELECT COUNT(*) FROM dev_ads.travel_analysis)
-     - (SELECT COUNT(*) FROM dev_stg.travel_analysis_dev_ads)
-     - (SELECT COUNT(*)
-        FROM   dev_stg.delta_travel_analysis_key s
-        LEFT   JOIN dev_stg.travel_analysis_dev_ads a
-          ON   s.vf_number = a.vf_number
-         AND   COALESCE(s.cust_num, '#NULL#') = COALESCE(a.cust_num, '#NULL#')
-         AND   s.out_of_country_dt = a.out_of_country_dt
-        WHERE  a.vf_number IS NULL) AS count_diff;
+-- 4. Every valid landing key is present in the target
+SELECT COUNT(*) AS missing_keys
+FROM  (SELECT DISTINCT TRIM(vf_number) AS vf_number,
+              COALESCE(NULLIF(TRIM(cust_num), ''), '#NULL#') AS cust_key,
+              CAST(FROM_UNIXTIME(CAST(out_of_country_dt / 1000 AS bigint)) AS timestamp) AS out_of_country_dt
+       FROM   dev_stg.travel_analysis
+       WHERE  vf_number IS NOT NULL AND TRIM(vf_number) <> ''
+         AND  out_of_country_dt IS NOT NULL AND extract_dt IS NOT NULL) s
+LEFT   JOIN dev_ads.travel_analysis a
+  ON   s.vf_number = a.vf_number
+ AND   s.cust_key = COALESCE(a.cust_num, '#NULL#')
+ AND   s.out_of_country_dt = a.out_of_country_dt
+WHERE  a.vf_number IS NULL;

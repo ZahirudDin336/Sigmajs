@@ -19,7 +19,9 @@ spark = (SparkSession.builder.master("local[2]")
          .config("spark.sql.warehouse.dir", os.path.join(work, "wh"))
          .config("javax.jdo.option.ConnectionURL", f"jdbc:derby:;databaseName={work}/ms;create=true")
          .config("spark.sql.session.timeZone", "UTC")
-         .config("spark.sql.legacy.allowNonEmptyLocationInCTAS", "true")
+         # Hive-style write (staging dir + move) so the target can be read while overwritten
+         .config("spark.sql.hive.convertMetastoreParquet", "false")
+         .config("spark.sql.hive.convertInsertingNonPartitionedTable", "false")
          .enableHiveSupport().getOrCreate())
 spark.sparkContext.setLogLevel("ERROR")
 
@@ -38,7 +40,7 @@ def run_load():
         if st.upper().startswith("SET "):
             continue
         # landing table is created by the test itself
-        if "dev_stg.travel_analysis(" in st or re.match(r"DROP TABLE IF EXISTS dev_stg\.travel_analysis$", st):
+        if "dev_stg.travel_analysis(" in st:
             continue
         spark.sql(st)
 
@@ -61,7 +63,8 @@ spark.sql("""INSERT INTO dev_ads.travel_analysis VALUES
  ('K5','C5',TIMESTAMP'2026-09-01 00:00:00',TIMESTAMP'2026-09-05 00:00:00','Spain, Italy','Z',20260930),
  ('K6',NULL,TIMESTAMP'2026-09-01 00:00:00',TIMESTAMP'2999-12-31 00:00:00','Oman','R',20260930),
  ('K7','C7',TIMESTAMP'2026-09-01 00:00:00',TIMESTAMP'2999-12-31 00:00:00','India,UAE',NULL,20260930),
- ('K2','C2',TIMESTAMP'2026-09-01 00:00:00',TIMESTAMP'2999-12-31 00:00:00',NULL,NULL,20260930)
+ ('K2','C2',TIMESTAMP'2026-09-01 00:00:00',TIMESTAMP'2999-12-31 00:00:00',NULL,NULL,20260930),
+ ('K9','C9',TIMESTAMP'2026-09-01 00:00:00',TIMESTAMP'2999-12-31 00:00:00',' Oman ',NULL,20260930)
 """)
 
 # --- landing (stage) ----------------------------------------------------
@@ -82,6 +85,8 @@ stage = [
     (D2, "K6", None, T1, OPEN, "Yemen", None),
     (D1, "K7", "C7", T1, OPEN, "UAE", None),                       # list without space
     (D1, "K8", "C8", T1, OPEN, "QATAR", None),                     # new key, only qatar
+    (D1, "K9", "C9", T1, OPEN, "  oman  ", None),                  # padded existing country
+    (D2, "K9", "C9", T1, OPEN, " Yemen ", None),                   # padded new country
     (D1, None, "C9", T1, OPEN, "Peru", None),                      # null vf -> rejected
 ]
 cols = "extract_dt bigint, vf_number string, cust_num string, out_of_country_dt bigint, " \
@@ -98,6 +103,7 @@ expected = {
     "K6": (None, "2999-12-31 00:00:00", "Oman, Yemen", "R", 20261002),
     "K7": ("C7", "2999-12-31 00:00:00", "India, UAE", None, 20261001),
     "K8": ("C8", "2999-12-31 00:00:00", None, None, 20261001),
+    "K9": ("C9", "2999-12-31 00:00:00", "Oman, Yemen", None, 20261002),
 }
 
 
