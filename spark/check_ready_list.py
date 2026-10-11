@@ -38,8 +38,8 @@ ready_list_query = """
 """
 
 # One READY row per (dataset, table) and day: the latest load of the source
-# wins, rows without a mapped DAG are skipped, rows already logged today are
-# skipped. triggered_ts stays NULL until the Airflow DAG triggers the DAG.
+# wins, rows without a mapped DAG or insert_load_id (the key the Airflow DAG
+# updates by) are skipped, rows already logged today are skipped. triggered_ts stays NULL until the Airflow DAG triggers the DAG.
 INSERT_NEW_READY_SQL = f"""
 INSERT INTO {UPSTREAM_TRIGGER_LOG}
 (
@@ -67,6 +67,7 @@ FROM (
                               ORDER BY s.execution_date DESC, s.insert_load_id DESC) AS rn
     FROM {BD_test_upstream_dly} s
     WHERE s.airflow_dag_name IS NOT NULL
+      AND s.insert_load_id IS NOT NULL
 ) o
 LEFT JOIN (
     SELECT DISTINCT dataset_name, source_tablename

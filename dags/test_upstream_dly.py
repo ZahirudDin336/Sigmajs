@@ -105,18 +105,20 @@ TODAY_FILTER = (
 REFRESH_SQL = f"REFRESH {TRIGGER_LOG_TABLE}"
 
 SELECT_DAY_STATE_SQL = f"""
-    SELECT dag_name, status, MIN(source_insert_dt) AS first_insert_dt
+    SELECT dag_name, status, insert_load_id, source_insert_dt
     FROM {TRIGGER_LOG_TABLE}
     WHERE {TODAY_FILTER}
       AND dag_name IS NOT NULL
-    GROUP BY dag_name, status
 """
 
+# Rows are addressed by insert_load_id, so every update touches exactly the
+# rows that were read (dag_name and the day filter are extra safety).
 UPDATE_STATUS_SQL = f"""
     UPDATE {TRIGGER_LOG_TABLE}
     SET status = %(status)s,{{extra_set}}
         updated_ts = now()
-    WHERE dag_name = %(dag_name)s
+    WHERE insert_load_id IN ({{load_ids}})
+      AND dag_name = %(dag_name)s
       AND status IN ({{from_statuses}})
       AND {TODAY_FILTER}
 """
@@ -182,10 +184,16 @@ class DayState:
     running: list[str] = field(default_factory=list)
     succeeded: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+    # dag_name -> status -> sorted insert_load_ids of today's rows
+    load_ids: dict[str, dict[str, list[int]]] = field(default_factory=dict)
 
     @property
     def finished(self) -> list[str]:
         return self.succeeded + self.failed
+
+    def ids(self, dag_name: str, *statuses: str) -> list[int]:
+        by_status = self.load_ids.get(dag_name, {})
+        return sorted({i for status in statuses for i in by_status.get(status, [])})
 
 
 def fetch_day_state(hook: Any, run_date: str, exclude: Iterable[str] = ()) -> DayState:
@@ -197,16 +205,21 @@ def fetch_day_state(hook: Any, run_date: str, exclude: Iterable[str] = ()) -> Da
     excluded = set(exclude)
     statuses: dict[str, set[str]] = {}
     first_seen: dict[str, Any] = {}
-    for row in records:
-        dag_name = (row[0] or "").strip()
-        status = (row[1] or "").strip().upper()
+    state = DayState()
+    for dag_name, status, load_id, insert_dt in records:
+        dag_name = (dag_name or "").strip()
+        status = (status or "").strip().upper()
         if not dag_name or dag_name in excluded:
             continue
+        if load_id is None:
+            logger.warning("Ignoring a %s row of %s without insert_load_id (cannot be updated uniquely)",
+                           status, dag_name)
+            continue
         statuses.setdefault(dag_name, set()).add(status)
-        if row[2] is not None and (dag_name not in first_seen or str(row[2]) < str(first_seen[dag_name])):
-            first_seen[dag_name] = row[2]
+        state.load_ids.setdefault(dag_name, {}).setdefault(status, []).append(int(load_id))
+        if insert_dt is not None and (dag_name not in first_seen or str(insert_dt) < str(first_seen[dag_name])):
+            first_seen[dag_name] = insert_dt
 
-    state = DayState()
     for dag_name in sorted(statuses, key=lambda d: (str(first_seen.get(d, "")), d)):
         dag_statuses = statuses[dag_name]
         if STATUS_TRIGGERED in dag_statuses:
@@ -240,10 +253,11 @@ def is_day_complete(state: DayState, expected: int) -> bool:
     return len(state.finished) >= expected and not state.running and not state.ready
 
 
-def select_dags_to_trigger(state: DayState, max_parallel: int = MAX_PARALLEL_DAGS) -> list[str]:
-    """READY DAGs (oldest first) that fit in the free parallel slots."""
+def select_dags_to_trigger(state: DayState, max_parallel: int = MAX_PARALLEL_DAGS) -> list[dict]:
+    """READY DAGs (oldest first) that fit in the free parallel slots, each with the
+    insert_load_ids of its READY rows: ``{"dag_name": ..., "insert_load_ids": [...]}``."""
     free_slots = max(0, max_parallel - len(state.running))
-    return state.ready[:free_slots]
+    return [{"dag_name": d, "insert_load_ids": state.ids(d, STATUS_READY)} for d in state.ready[:free_slots]]
 
 
 def update_status(
@@ -253,16 +267,25 @@ def update_status(
     run_date: str,
     status: str,
     from_statuses: Iterable[str],
+    insert_load_ids: Iterable[int],
     set_triggered_ts: bool = False,
     **retry_kwargs,
 ) -> None:
-    """Set today's rows of ``dag_name`` that are in ``from_statuses`` to ``status``."""
+    """Set the rows ``insert_load_ids`` of ``dag_name`` that are in ``from_statuses`` to ``status``."""
+    load_ids = sorted({int(i) for i in insert_load_ids})
+    if not load_ids:
+        raise ValueError(f"No insert_load_id given for {dag_name}; refusing an unbounded update")
+    from_statuses = list(from_statuses)
+    parameters = {"status": status, "dag_name": dag_name, **day_bounds(run_date)}
+    parameters.update({f"load_id_{n}": load_id for n, load_id in enumerate(load_ids)})
     sql = UPDATE_STATUS_SQL.format(
         extra_set="\n        triggered_ts = now()," if set_triggered_ts else "",
+        load_ids=", ".join(f"%(load_id_{n})s" for n in range(len(load_ids))),
         from_statuses=_sql_in_list(from_statuses),
     )
-    run_impala(hook, sql, {"status": status, "dag_name": dag_name, **day_bounds(run_date)}, **retry_kwargs)
-    logger.info("%s: %s -> %s (%s)", dag_name, "/".join(from_statuses), status, run_date)
+    run_impala(hook, sql, parameters, **retry_kwargs)
+    logger.info("%s insert_load_id=%s: %s -> %s (%s)", dag_name, load_ids, "/".join(from_statuses), status,
+                run_date)
 
 
 class ChildRunAlreadyExists(AirflowException):
@@ -391,7 +414,7 @@ def reconcile_triggered_dags(
                     summary["running"].append(dag_name)
                     continue
             update_status(hook, dag_name=dag_name, run_date=run_date, status=new_status,
-                          from_statuses=[STATUS_TRIGGERED])
+                          from_statuses=[STATUS_TRIGGERED], insert_load_ids=state.ids(dag_name, STATUS_TRIGGERED))
             summary["succeeded" if new_status == STATUS_SUCCEEDED else "failed"].append(dag_name)
         except Exception:
             # Keep reconciling the other DAGs; fail the task at the end.
@@ -404,15 +427,16 @@ def reconcile_triggered_dags(
     return summary
 
 
-def _mark_final(hook: Any, dag_name: str, run_date: str, status: str) -> None:
+def _mark_final(hook: Any, dag_name: str, run_date: str, status: str, load_ids: list[int]) -> None:
     # READY too: the DAG ran even if marking it TRIGGERED failed earlier.
     update_status(hook, dag_name=dag_name, run_date=run_date, status=status,
-                  from_statuses=[STATUS_READY, STATUS_TRIGGERED])
+                  from_statuses=[STATUS_READY, STATUS_TRIGGERED], insert_load_ids=load_ids)
 
 
 def trigger_and_wait(
     *,
     dag_name: str,
+    insert_load_ids: list[int],
     run_date: str,
     parent_dag_id: str,
     parent_run_id: str,
@@ -423,9 +447,13 @@ def trigger_and_wait(
 ) -> str:
     """Trigger one upstream DAG, wait for it and keep its log rows in sync.
 
-    Returns the final state ("success"), or "skipped" when another master run
-    already owns today's run of this DAG. Raises when the DAG fails.
+    Only the rows ``insert_load_ids`` (the READY rows that were selected) are
+    updated. Returns the final state ("success"), or "skipped" when another
+    master run already owns today's run of this DAG. Raises when the DAG fails.
     """
+    load_ids = sorted({int(i) for i in insert_load_ids})
+    if not load_ids:
+        raise AirflowException(f"No insert_load_id for {dag_name}; nothing to trigger")
     trigger = trigger or trigger_child_dag
     wait = wait or wait_for_dag_run
     list_runs = list_runs or list_child_runs
@@ -439,9 +467,9 @@ def trigger_and_wait(
     elif any(r.state not in (DagRunState.SUCCESS, DagRunState.FAILED) for r in existing):
         logger.info("%s already has an active run for %s from another master run; skipping", dag_name, run_date)
         return "skipped"
-    elif dag_name not in fetch_day_state(hook, run_date).ready:
-        # This task waited for a free slot and meanwhile another master run handled the DAG.
-        logger.info("%s is no longer %s for %s; skipping", dag_name, STATUS_READY, run_date)
+    elif not set(load_ids) & set(fetch_day_state(hook, run_date).ids(dag_name, STATUS_READY)):
+        # The selected rows are no longer READY: another master run handled the DAG.
+        logger.info("%s rows %s are no longer %s; skipping", dag_name, load_ids, STATUS_READY)
         return "skipped"
     else:
         run_id = None
@@ -450,7 +478,8 @@ def trigger_and_wait(
             run_id = trigger(
                 dag_name,
                 build_child_run_id(run_date, len(existing) + 1),
-                conf={"run_date": run_date, "parent_dag_id": parent_dag_id, "parent_run_id": parent_run_id},
+                conf={"run_date": run_date, "parent_dag_id": parent_dag_id, "parent_run_id": parent_run_id,
+                  "insert_load_ids": load_ids},
             )
     except ChildRunAlreadyExists:
         logger.info("%s was just triggered by another master run; skipping", dag_name)
@@ -458,7 +487,7 @@ def trigger_and_wait(
     except Exception as exc:
         logger.error("Could not trigger %s: %s", dag_name, exc)
         try:
-            _mark_final(hook, dag_name, run_date, STATUS_FAILED)
+            _mark_final(hook, dag_name, run_date, STATUS_FAILED, load_ids)
         except Exception:
             logger.exception("Could not mark %s as %s", dag_name, STATUS_FAILED)
         raise
@@ -466,7 +495,7 @@ def trigger_and_wait(
     # 2. Mark it TRIGGERED. If that fails keep going: the final update fixes the row.
     try:
         update_status(hook, dag_name=dag_name, run_date=run_date, status=STATUS_TRIGGERED,
-                      from_statuses=[STATUS_READY], set_triggered_ts=True)
+                      from_statuses=[STATUS_READY], insert_load_ids=load_ids, set_triggered_ts=True)
     except Exception:
         logger.exception("Could not mark %s as %s; continuing", dag_name, STATUS_TRIGGERED)
 
@@ -476,9 +505,9 @@ def trigger_and_wait(
 
     # 4. Final status.
     if state == DagRunState.SUCCESS.value:
-        _mark_final(hook, dag_name, run_date, STATUS_SUCCEEDED)
+        _mark_final(hook, dag_name, run_date, STATUS_SUCCEEDED, load_ids)
         return state
-    _mark_final(hook, dag_name, run_date, STATUS_FAILED)
+    _mark_final(hook, dag_name, run_date, STATUS_FAILED, load_ids)
     raise AirflowException(f"DAG {dag_name} run {run_id} finished as {state}")
 
 
@@ -558,12 +587,12 @@ with DAG(
     )
 
     @task(max_active_tis_per_dag=1)
-    def get_dags_to_trigger(run_date: str) -> list[str]:
+    def get_dags_to_trigger(run_date: str) -> list[dict]:
         state = fetch_day_state(get_impala_hook(), run_date, exclude=[DAG_ID])
         to_trigger = select_dags_to_trigger(state)
         logger.info(
             "%s: running=%s ready=%s -> triggering %s (max %s in parallel)",
-            run_date, state.running, state.ready, to_trigger, MAX_PARALLEL_DAGS,
+            run_date, state.running, state.ready, [e["dag_name"] for e in to_trigger], MAX_PARALLEL_DAGS,
         )
         return to_trigger
 
@@ -571,10 +600,13 @@ with DAG(
     @task(
         max_active_tis_per_dag=MAX_PARALLEL_DAGS,
         execution_timeout=CHILD_DAG_TIMEOUT + timedelta(minutes=15),
+        # Show the DAG name instead of 0, 1, 2... in the UI.
+        map_index_template="{{ task.op_kwargs['entry']['dag_name'] }}",
     )
-    def trigger_upstream_dag(dag_name: str, run_date: str, **context) -> str:
+    def trigger_upstream_dag(entry: dict, run_date: str, **context) -> str:
         return trigger_and_wait(
-            dag_name=dag_name,
+            dag_name=entry["dag_name"],
+            insert_load_ids=entry["insert_load_ids"],
             run_date=run_date,
             parent_dag_id=context["dag"].dag_id,
             parent_run_id=context["run_id"],
@@ -585,7 +617,7 @@ with DAG(
     pending = check_day_pending(run_date=RUN_DATE_TEMPLATE)
     validated = validate_edw_connection()
     to_trigger = get_dags_to_trigger(run_date=RUN_DATE_TEMPLATE)
-    triggered = trigger_upstream_dag.partial(run_date=RUN_DATE_TEMPLATE).expand(dag_name=to_trigger)
+    triggered = trigger_upstream_dag.partial(run_date=RUN_DATE_TEMPLATE).expand(entry=to_trigger)
 
     # NONE_FAILED: succeeds when every DAG succeeded or nothing had to run;
     # fails when any DAG failed.

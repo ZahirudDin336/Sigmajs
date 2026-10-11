@@ -100,6 +100,7 @@ def test_inserts_one_ready_row_per_new_dataset(spark, tables):
         ("ds2", "t2", "", "SUCCESS", TODAY + timedelta(hours=1), NOW, 3),      # no DAG mapped
         ("ds3", "t3", "dag_b", "SUCCESS", TODAY + timedelta(hours=1), NOW, 4),
         ("ds4", "t4", "dag_c", "SUCCESS", TODAY + timedelta(hours=1), NOW, 5),   # already logged today
+        ("ds5", "t5", "dag_d", "SUCCESS", TODAY + timedelta(hours=1), NOW, None),  # no insert_load_id
     ])
     add_log_row(spark, "ds4", "t4", "dag_c", "TRIGGERED", TODAY + timedelta(minutes=5))
     add_log_row(spark, "ds3", "t3", "dag_b", "SUCCEEDED", YESTERDAY + timedelta(hours=1))
@@ -118,7 +119,7 @@ def test_inserts_one_ready_row_per_new_dataset(spark, tables):
     assert [(r.dataset_name, r.status) for r in rows if r.status != "READY"] == [
         ("ds3", "SUCCEEDED"), ("ds4", "TRIGGERED")]
     # Staging table holds the full source extract.
-    assert spark.table(job.BD_test_upstream_dly).count() == 5
+    assert spark.table(job.BD_test_upstream_dly).count() == 6
 
 
 def test_rerun_every_15_minutes_inserts_nothing_new(spark, tables):

@@ -143,9 +143,27 @@ def test_fetch_day_state_classifies_and_orders():
     (0, 8, 6), (2, 8, 4), (6, 3, 0), (7, 3, 0), (0, 2, 2),
 ])
 def test_select_dags_to_trigger_respects_max_parallel(running, ready, expected):
-    state = m.DayState(ready=[f"r{i}" for i in range(ready)], running=[f"x{i}" for i in range(running)])
+    state = m.DayState(ready=[f"r{i}" for i in range(ready)], running=[f"x{i}" for i in range(running)],
+                       load_ids={f"r{i}": {m.STATUS_READY: [i]} for i in range(ready)})
     selected = m.select_dags_to_trigger(state)
-    assert selected == state.ready[:expected]
+    assert selected == [{"dag_name": f"r{i}", "insert_load_ids": [i]} for i in range(expected)]
+
+
+def test_fetch_day_state_collects_insert_load_ids():
+    hook = FakeImpalaHook.with_rows(
+        row("dag_a", load_id=11), row("dag_a", load_id=12, dataset="ds2"),
+        row("dag_b", m.STATUS_TRIGGERED, load_id=21), row("dag_b", m.STATUS_READY, load_id=22, dataset="late"),
+        row("dag_c", load_id=None), row("dag_d", load_id=None), row("dag_d", load_id=41, dataset="ds2"),
+    )
+    hook.rows[4]["insert_load_id"] = hook.rows[5]["insert_load_id"] = None
+    state = m.fetch_day_state(hook, RUN_DATE)
+    assert state.ready == ["dag_a", "dag_d"]  # dag_c has no usable row
+    assert state.ids("dag_a", m.STATUS_READY) == [11, 12]
+    assert state.ids("dag_b", m.STATUS_TRIGGERED) == [21]
+    assert state.ids("dag_b", m.STATUS_READY, m.STATUS_TRIGGERED) == [21, 22]
+    assert state.ids("dag_d", m.STATUS_READY) == [41]
+    assert m.select_dags_to_trigger(state) == [{"dag_name": "dag_a", "insert_load_ids": [11, 12]},
+                                               {"dag_name": "dag_d", "insert_load_ids": [41]}]
 
 
 @pytest.mark.parametrize("succeeded, failed, running, ready, complete", [
@@ -174,22 +192,35 @@ def test_expected_dag_count_default_and_variable(airflow_db, monkeypatch):
 
 
 def test_update_status_sql_and_effect():
-    hook = FakeImpalaHook.with_rows(row("dag_a"), row("dag_a", dataset="ds2"), row("dag_a", day="2026-10-10"))
+    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=11), row("dag_a", load_id=12, dataset="ds2"),
+                                    row("dag_a", load_id=13, dataset="late"), row("dag_a", day="2026-10-10"))
     m.update_status(hook, dag_name="dag_a", run_date=RUN_DATE, status=m.STATUS_TRIGGERED,
-                    from_statuses=[m.STATUS_READY], set_triggered_ts=True)
+                    from_statuses=[m.STATUS_READY], insert_load_ids=[12, 11, 12], set_triggered_ts=True)
     sql = " ".join(hook.executed[0].split())
-    assert sql.startswith("UPDATE dev_stg.upstream_trigger_log SET status = 'TRIGGERED', "
-                          "triggered_ts = now(), updated_ts = now() WHERE dag_name = 'dag_a' "
-                          "AND status IN ('READY') AND source_insert_dt >= CAST('2026-10-11 00:00:00' AS TIMESTAMP)")
-    assert hook.statuses("dag_a") == [m.STATUS_TRIGGERED, m.STATUS_TRIGGERED]
+    assert sql == ("UPDATE dev_stg.upstream_trigger_log SET status = 'TRIGGERED', "
+                   "triggered_ts = now(), updated_ts = now() WHERE insert_load_id IN (11, 12) "
+                   "AND dag_name = 'dag_a' AND status IN ('READY') "
+                   "AND source_insert_dt >= CAST('2026-10-11 00:00:00' AS TIMESTAMP) "
+                   "AND source_insert_dt < CAST('2026-10-12 00:00:00' AS TIMESTAMP)")
+    # Only the given insert_load_ids change.
+    assert hook.statuses("dag_a") == [m.STATUS_TRIGGERED, m.STATUS_TRIGGERED, m.STATUS_READY]
     assert all(r["triggered_ts"] == NOW and r["updated_ts"] == NOW for r in hook.rows[:2])
+    assert hook.rows[2]["updated_ts"] is None
     assert hook.status("dag_a", "2026-10-10") == m.STATUS_READY  # other days untouched
+
+
+def test_update_status_requires_insert_load_ids():
+    hook = FakeImpalaHook()
+    with pytest.raises(ValueError, match="insert_load_id"):
+        m.update_status(hook, dag_name="dag_a", run_date=RUN_DATE, status=m.STATUS_FAILED,
+                        from_statuses=[m.STATUS_READY], insert_load_ids=[])
+    assert hook.executed == []
 
 
 def test_final_status_update_sets_updated_ts_only():
     hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_TRIGGERED))
     m.update_status(hook, dag_name="dag_a", run_date=RUN_DATE, status=m.STATUS_SUCCEEDED,
-                    from_statuses=[m.STATUS_TRIGGERED])
+                    from_statuses=[m.STATUS_TRIGGERED], insert_load_ids=hook.load_ids("dag_a"))
     sql = " ".join(hook.executed[0].split())
     assert "SET status = 'SUCCEEDED', updated_ts = now()" in sql
     assert "triggered_ts" not in sql
@@ -199,7 +230,7 @@ def test_final_status_update_sets_updated_ts_only():
 def test_update_status_escapes_values():
     hook = FakeImpalaHook()
     m.update_status(hook, dag_name="x'; DROP TABLE t; --", run_date=RUN_DATE, status=m.STATUS_FAILED,
-                    from_statuses=[m.STATUS_READY])
+                    from_statuses=[m.STATUS_READY], insert_load_ids=[1])
     assert "dag_name = 'x\\'; DROP TABLE t; --'" in hook.executed[0]
 
 
@@ -207,7 +238,8 @@ def test_impala_retries_commit_conflicts():
     hook = FakeImpalaHook.with_rows(row("dag_a"), fail_runs=2)
     sleeps = []
     m.update_status(hook, dag_name="dag_a", run_date=RUN_DATE, status=m.STATUS_TRIGGERED,
-                    from_statuses=[m.STATUS_READY], backoff_seconds=1, sleep=sleeps.append)
+                    from_statuses=[m.STATUS_READY], insert_load_ids=hook.load_ids("dag_a"),
+                    backoff_seconds=1, sleep=sleeps.append)
     assert hook.status("dag_a") == m.STATUS_TRIGGERED
     assert len(sleeps) == 2 and 1 <= sleeps[0] <= 2 and 2 <= sleeps[1] <= 3
 
@@ -216,7 +248,8 @@ def test_impala_gives_up_after_max_attempts():
     hook = FakeImpalaHook.with_rows(row("dag_a"), fail_runs=10)
     with pytest.raises(RuntimeError, match="CommitFailedException"):
         m.update_status(hook, dag_name="dag_a", run_date=RUN_DATE, status=m.STATUS_TRIGGERED,
-                        from_statuses=[m.STATUS_READY], attempts=3, sleep=no_sleep)
+                        from_statuses=[m.STATUS_READY], insert_load_ids=hook.load_ids("dag_a"),
+                        attempts=3, sleep=no_sleep)
     assert hook.fail_runs == 7
     assert hook.status("dag_a") == m.STATUS_READY
 
@@ -243,9 +276,10 @@ def test_validate_edw_connection_config():
 CHILD_RUN_1 = f"upstream__{RUN_DATE}__1"
 
 
-def _run(hook, trigger=None, wait=None, existing=(), parent_run_id="scheduled__1"):
+def _run(hook, trigger=None, wait=None, existing=(), parent_run_id="scheduled__1", load_ids=None):
     return m.trigger_and_wait(
-        dag_name="dag_a", run_date=RUN_DATE, parent_dag_id=m.DAG_ID, parent_run_id=parent_run_id, hook=hook,
+        dag_name="dag_a", insert_load_ids=hook.load_ids("dag_a") if load_ids is None else load_ids,
+        run_date=RUN_DATE, parent_dag_id=m.DAG_ID, parent_run_id=parent_run_id, hook=hook,
         trigger=trigger or mock.Mock(return_value=CHILD_RUN_1),
         wait=wait or mock.Mock(return_value="success"),
         list_runs=lambda *_: list(existing),
@@ -264,7 +298,8 @@ def test_success_waits_then_marks_succeeded():
     assert _run(hook, trigger, wait) == "success"
     trigger.assert_called_once_with(
         "dag_a", CHILD_RUN_1,
-        conf={"run_date": RUN_DATE, "parent_dag_id": m.DAG_ID, "parent_run_id": "scheduled__1"},
+        conf={"run_date": RUN_DATE, "parent_dag_id": m.DAG_ID, "parent_run_id": "scheduled__1",
+              "insert_load_ids": hook.load_ids("dag_a")},
     )
     # TRIGGERED while waiting, SUCCEEDED after.
     assert seen == [(CHILD_RUN_1, [m.STATUS_TRIGGERED, m.STATUS_TRIGGERED])]
@@ -360,6 +395,37 @@ def test_rerun_after_reset_to_ready_uses_next_attempt():
     assert _run(hook, trigger, existing=[failed_before]) == "success"
     assert trigger.call_args.args[1] == f"upstream__{RUN_DATE}__2"
     assert hook.status("dag_a") == m.STATUS_SUCCEEDED
+
+
+def test_only_selected_rows_are_updated():
+    # A row for the same DAG that became READY after selection keeps its status.
+    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=11), row("dag_a", load_id=12, dataset="late"))
+    assert _run(hook, load_ids=[11]) == "success"
+    assert {r["insert_load_id"]: r["status"] for r in hook.rows} == {11: m.STATUS_SUCCEEDED, 12: m.STATUS_READY}
+    assert all("insert_load_id IN (11)" in sql for sql in hook.executed if sql.lstrip().startswith("UPDATE"))
+
+
+def test_failure_updates_only_selected_rows():
+    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=11), row("dag_a", load_id=12, dataset="late"))
+    with pytest.raises(AirflowException):
+        _run(hook, wait=mock.Mock(return_value="failed"), load_ids=[11])
+    assert {r["insert_load_id"]: r["status"] for r in hook.rows} == {11: m.STATUS_FAILED, 12: m.STATUS_READY}
+
+
+def test_no_insert_load_ids_is_rejected():
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    trigger = mock.Mock()
+    with pytest.raises(AirflowException, match="insert_load_id"):
+        _run(hook, trigger, load_ids=[])
+    trigger.assert_not_called()
+
+
+def test_skips_when_selected_rows_are_no_longer_ready():
+    hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_SUCCEEDED, load_id=11),
+                                    row("dag_a", load_id=12, dataset="late"))
+    trigger = mock.Mock()
+    assert _run(hook, trigger, load_ids=[11]) == "skipped"
+    trigger.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #
@@ -522,12 +588,13 @@ def test_trigger_and_wait_against_real_metadata_db(child_dag):
         _set_state(run_id, DagRunState.SUCCESS)
         return m.wait_for_dag_run(dag_id, run_id, poke_interval=0)
 
-    assert m.trigger_and_wait(dag_name="child_dag", run_date=RUN_DATE, parent_dag_id=m.DAG_ID,
-                              parent_run_id="p1", hook=hook, wait=finish) == "success"
+    ids = hook.load_ids("child_dag")
+    assert m.trigger_and_wait(dag_name="child_dag", insert_load_ids=ids, run_date=RUN_DATE,
+                              parent_dag_id=m.DAG_ID, parent_run_id="p1", hook=hook, wait=finish) == "success"
     assert hook.status("child_dag") == m.STATUS_SUCCEEDED
     # A second master run for the same day does not trigger it again.
-    assert m.trigger_and_wait(dag_name="child_dag", run_date=RUN_DATE, parent_dag_id=m.DAG_ID,
-                              parent_run_id="p2", hook=hook) == "skipped"
+    assert m.trigger_and_wait(dag_name="child_dag", insert_load_ids=ids, run_date=RUN_DATE,
+                              parent_dag_id=m.DAG_ID, parent_run_id="p2", hook=hook) == "skipped"
     assert len(m.list_child_runs("child_dag", RUN_DATE)) == 1
 
 
@@ -606,6 +673,8 @@ def test_end_to_end_day(airflow_db, monkeypatch):
     assert hook.status("dag_old", "2026-10-10") == m.STATUS_READY
     mapped = [s for (task_id, _), s in states.items() if task_id == "trigger_upstream_dag"]
     assert sorted(mapped) == sorted([TaskInstanceState.SUCCESS] * 4 + [TaskInstanceState.FAILED])
+    labels = {ti.rendered_map_index for ti in dag_run.get_task_instances() if ti.task_id == "trigger_upstream_dag"}
+    assert labels == set(names[:5])  # the UI shows the DAG name per mapped task
     assert states[("end", -1)] == TaskInstanceState.UPSTREAM_FAILED
     assert dag_run.state == DagRunState.FAILED  # a DAG failed: visible in the UI / alerts
 
