@@ -3,9 +3,12 @@
 --
 -- Key : vf_number + cust_num + out_of_country_dt
 --
--- One INSERT OVERWRITE, no intermediate tables, no joins:
---   target rows + landing rows -> UNION ALL -> GROUP BY key+country
---   (first occurrence) -> GROUP BY key (merge).
+-- No joins. Each step is a dev_stg work table (kept for debugging/DQ):
+--   1. dev_stg.travel_analysis_src     : target rows + landing rows (UNION ALL),
+--                                        one row per country
+--   2. dev_stg.travel_analysis_country : one row per key + country (first occurrence)
+--   3. dev_stg.travel_analysis_key     : one row per key (merged)
+--   4. INSERT OVERWRITE dev_ads.travel_analysis from step 3
 --
 -- travelling_country : existing order kept, new countries appended by
 -- extract_dt, no duplicates (trim + case-insensitive), stage NULL / ''
@@ -39,9 +42,13 @@ CREATE TABLE IF NOT EXISTS dev_ads.travel_analysis(
   extract_dt           int)
 STORED AS PARQUET;
 
-WITH
--- one row per country; ord = sort key (src + extract_dt + position)
-src AS (
+-- ---------------------------------------------------------------------
+-- 1. one row per country; ord = sort key (src + extract_dt + position)
+--    also the snapshot of the target, so the final overwrite never reads
+--    the table it writes
+-- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS dev_stg.travel_analysis_src;
+CREATE TABLE dev_stg.travel_analysis_src STORED AS PARQUET AS
   -- existing target: list exploded, original position kept
   SELECT t.vf_number,
          COALESCE(t.cust_num, '#NULL#')                                    AS cust_key,
@@ -75,10 +82,13 @@ src AS (
   FROM   dev_stg.travel_analysis
   WHERE  NULLIF(TRIM(vf_number), '') IS NOT NULL
     AND  out_of_country_dt IS NOT NULL
-    AND  extract_dt IS NOT NULL
-),
--- one row per key + country: first occurrence wins -> no duplicates
-per_country AS (
+    AND  extract_dt IS NOT NULL;
+
+-- ---------------------------------------------------------------------
+-- 2. one row per key + country: first occurrence wins -> no duplicates
+-- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS dev_stg.travel_analysis_country;
+CREATE TABLE dev_stg.travel_analysis_country STORED AS PARQUET AS
   SELECT vf_number, cust_key, out_of_country_dt,
          MIN(CONCAT(ord, '#', country))                                    AS ord_country,
          MAX(extract_dt)                                                   AS extract_dt,
@@ -90,11 +100,14 @@ per_country AS (
          MAX(IF(is_stg = 0, roaming_sp_name, NULL))                        AS tgt_roaming,
          MAX(IF(is_stg = 1 AND roaming_sp_name IS NOT NULL,
                 NAMED_STRUCT('e', extract_dt, 'v', roaming_sp_name), NULL)) AS stg_roaming
-  FROM   src
-  GROUP  BY vf_number, cust_key, out_of_country_dt, UPPER(country)
-),
--- one row per key
-per_key AS (
+  FROM   dev_stg.travel_analysis_src
+  GROUP  BY vf_number, cust_key, out_of_country_dt, UPPER(country);
+
+-- ---------------------------------------------------------------------
+-- 3. one row per key
+-- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS dev_stg.travel_analysis_key;
+CREATE TABLE dev_stg.travel_analysis_key STORED AS PARQUET AS
   SELECT vf_number, cust_key, out_of_country_dt,
          SORT_ARRAY(COLLECT_LIST(ord_country))                             AS countries,
          MAX(extract_dt)                                                   AS extract_dt,
@@ -103,9 +116,12 @@ per_key AS (
          MAX(stg_open)                                                     AS stg_open,
          MAX(tgt_roaming)                                                  AS tgt_roaming,
          MAX(stg_roaming).v                                                AS stg_roaming
-  FROM   per_country
-  GROUP  BY vf_number, cust_key, out_of_country_dt
-)
+  FROM   dev_stg.travel_analysis_country
+  GROUP  BY vf_number, cust_key, out_of_country_dt;
+
+-- ---------------------------------------------------------------------
+-- 4. final load
+-- ---------------------------------------------------------------------
 INSERT OVERWRITE TABLE dev_ads.travel_analysis
 SELECT vf_number,
        NULLIF(cust_key, '#NULL#')                                          AS cust_num,
@@ -120,4 +136,4 @@ SELECT vf_number,
             ELSE CONCAT(stg_roaming, '|||', tgt_roaming)
        END                                                                 AS roaming_sp_name,
        extract_dt
-FROM   per_key;
+FROM   dev_stg.travel_analysis_key;
