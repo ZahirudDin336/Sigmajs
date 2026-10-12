@@ -6,9 +6,13 @@ Runs every 15 minutes (Asia/Qatar). Each run:
 1. ``reconcile_triggered``  - safety net: any DAG still ``TRIGGERED`` whose
    Airflow run already finished (e.g. its master task was killed) gets its log
    row set to ``SUCCEEDED`` / ``FAILED``.
-2. ``check_day_pending``    - if all expected DAGs (Variable
-   ``upstream_expected_dag_count``, default 6) finished today, skip the rest of
-   this run and every later run today; the next day starts afresh.
+2. ``check_day_pending``    - if today's work is done, skip the rest of this
+   run and every later run today; the next day starts afresh. "Done" means:
+   * production: every DAG in Variable ``upstream_dag_list`` has executed
+     today (SUCCEEDED or FAILED in the Impala log); until then the run keeps
+     checking and triggers only the listed DAGs that are still to run;
+   * testing (``upstream_dag_list`` not set): the number of executed DAGs
+     reaches Variable ``upstream_expected_dag_count`` (default 2).
 3. ``validate_edw_connection`` + ``check_ready_list`` (CDE Spark job) - load
    new READY rows for today into ``dev_stg.upstream_trigger_log``.
 4. ``get_dags_to_trigger``  - READY DAGs of today that have not run yet.
@@ -30,10 +34,14 @@ Airflow configuration
 * Connection ``vfq_impala``        - Impala.
 * Connection ``oracle-conn-edwdb`` - EDW (login, password, extra ``jdbc_url``).
 * Connection ``cde_runtime_api``   - CDE virtual cluster API.
-* Variable ``upstream_expected_dag_count`` (optional, default 6).
+* Variable ``upstream_dag_list`` (production): all DAG names to run each day,
+  as a JSON list (``["dag_a", "dag_b"]``) or comma separated (``dag_a, dag_b``).
+* Variable ``upstream_expected_dag_count`` (testing, used only when
+  ``upstream_dag_list`` is not set; default 2).
 """
 from __future__ import annotations
 
+import json
 import logging
 import random
 import time
@@ -67,8 +75,11 @@ EDW_CONN_ID = "oracle-conn-edwdb"
 CDE_JOB_NAME = "test_check_ready_list"
 TRIGGER_LOG_TABLE = "dev_stg.upstream_trigger_log"
 
+# Production: the list of DAG names that must run every day.
+DAG_LIST_VARIABLE = "upstream_dag_list"
+# Initial testing (only when upstream_dag_list is not set): number of DAGs.
 EXPECTED_DAGS_VARIABLE = "upstream_expected_dag_count"
-DEFAULT_EXPECTED_DAG_COUNT = 6
+DEFAULT_EXPECTED_DAG_COUNT = 2
 MAX_PARALLEL_DAGS = 6
 
 STATUS_READY = "READY"
@@ -274,16 +285,85 @@ def get_expected_dag_count() -> int:
     return count
 
 
-def is_day_complete(state: DayState, expected: int) -> bool:
-    """True when ``expected`` DAGs finished today and nothing is ready or running."""
-    return len(state.finished) >= expected and not state.running and not state.ready
+def parse_dag_list(raw: Any) -> list[str]:
+    """``upstream_dag_list`` as a list of names: JSON list or comma/newline separated."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        items = raw
+    else:
+        text = str(raw).strip()
+        if text.startswith(("[", "{")):
+            try:
+                items = json.loads(text)
+            except ValueError as exc:
+                raise AirflowException(f"Variable {DAG_LIST_VARIABLE} is not a valid JSON list: {exc}") from None
+            if not isinstance(items, list):
+                raise AirflowException(f"Variable {DAG_LIST_VARIABLE} must be a list of DAG names")
+        else:
+            items = text.replace("\n", ",").split(",")
+    names: list[str] = []
+    for item in items:
+        name = str(item).strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
 
-def select_dags_to_trigger(state: DayState, max_parallel: int = MAX_PARALLEL_DAGS) -> list[dict]:
+def get_upstream_dag_list() -> list[str]:
+    """Production DAG list from ``upstream_dag_list``; empty when not set."""
+    from airflow.models import Variable
+
+    names = parse_dag_list(Variable.get(DAG_LIST_VARIABLE, default_var=None))
+    if DAG_ID in names:
+        raise AirflowException(f"Variable {DAG_LIST_VARIABLE} must not contain {DAG_ID} itself")
+    return names
+
+
+def get_day_target() -> list[str] | int:
+    """What has to execute today: the DAG list (production) or a count (testing)."""
+    dag_list = get_upstream_dag_list()
+    if dag_list:
+        return dag_list
+    logger.info("Variable %s not set; using %s (testing mode)", DAG_LIST_VARIABLE, EXPECTED_DAGS_VARIABLE)
+    return get_expected_dag_count()
+
+
+def pending_dags(state: DayState, target: list[str] | int) -> list[str]:
+    """Listed DAGs that have not executed (SUCCEEDED/FAILED) today. Count mode: []."""
+    if isinstance(target, int):
+        return []
+    finished = set(state.finished)
+    return [d for d in target if d not in finished]
+
+
+def is_day_complete(state: DayState, target: list[str] | int) -> bool:
+    """True when today's work is done.
+
+    List (production): every listed DAG has executed today; running or READY
+    DAGs that are not in the list do not keep the day open.
+    Count (testing): ``target`` DAGs executed and nothing is ready or running.
+    """
+    if isinstance(target, int):
+        return len(state.finished) >= target and not state.running and not state.ready
+    return not pending_dags(state, target)
+
+
+def select_dags_to_trigger(
+    state: DayState, max_parallel: int = MAX_PARALLEL_DAGS, allowed: Iterable[str] | None = None
+) -> list[dict]:
     """READY DAGs (oldest first) that fit in the free parallel slots, each with the
-    insert_load_ids of its READY rows: ``{"dag_name": ..., "insert_load_ids": [...]}``."""
+    insert_load_ids of its READY rows: ``{"dag_name": ..., "insert_load_ids": [...]}``.
+    With ``allowed`` (the production list) only those DAGs are triggered."""
+    ready = state.ready
+    if allowed is not None:
+        allowed = set(allowed)
+        skipped = [d for d in ready if d not in allowed]
+        if skipped:
+            logger.warning("READY but not in %s, not triggered: %s", DAG_LIST_VARIABLE, skipped)
+        ready = [d for d in ready if d in allowed]
     free_slots = max(0, max_parallel - len(state.running))
-    return [{"dag_name": d, "insert_load_ids": state.ids(d, STATUS_READY)} for d in state.ready[:free_slots]]
+    return [{"dag_name": d, "insert_load_ids": state.ids(d, STATUS_READY)} for d in ready[:free_slots]]
 
 
 def update_status(
@@ -577,15 +657,19 @@ with DAG(
 
     @task.short_circuit(max_active_tis_per_dag=1)
     def check_day_pending(run_date: str) -> bool:
-        expected = get_expected_dag_count()
+        target = get_day_target()
         state = fetch_day_state(get_impala_hook(), run_date, exclude=[DAG_ID])
-        if is_day_complete(state, expected):
+        if is_day_complete(state, target):
             logger.info(
-                "All %s expected DAG(s) finished for %s (succeeded=%s, failed=%s); "
-                "skipping until tomorrow", expected, run_date, state.succeeded, state.failed,
+                "All expected DAG(s) executed for %s (%s; succeeded=%s, failed=%s); skipping until tomorrow",
+                run_date, target, state.succeeded, state.failed,
             )
             return False
-        logger.info("%s/%s DAG(s) finished for %s; continuing", len(state.finished), expected, run_date)
+        if isinstance(target, int):
+            logger.info("%s/%s DAG(s) executed for %s; continuing", len(state.finished), target, run_date)
+        else:
+            logger.info("%s: executed=%s, still to execute=%s; continuing",
+                        run_date, [d for d in target if d in state.finished], pending_dags(state, target))
         return True
 
     @task
@@ -615,7 +699,8 @@ with DAG(
     @task(max_active_tis_per_dag=1)
     def get_dags_to_trigger(run_date: str) -> list[dict]:
         state = fetch_day_state(get_impala_hook(), run_date, exclude=[DAG_ID])
-        to_trigger = select_dags_to_trigger(state)
+        dag_list = get_upstream_dag_list()
+        to_trigger = select_dags_to_trigger(state, allowed=dag_list or None)
         logger.info(
             "%s: running=%s ready=%s -> triggering %s (max %s in parallel)",
             run_date, state.running, state.ready, [e["dag_name"] for e in to_trigger], MAX_PARALLEL_DAGS,

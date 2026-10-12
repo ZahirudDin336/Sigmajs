@@ -215,13 +215,76 @@ def test_is_day_complete(succeeded, failed, running, ready, complete):
 
 
 def test_expected_dag_count_default_and_variable(airflow_db, monkeypatch):
-    assert m.get_expected_dag_count() == 6
+    assert m.DEFAULT_EXPECTED_DAG_COUNT == 2
+    assert m.get_expected_dag_count() == 2
     monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_EXPECTED_DAG_COUNT", "8")
     assert m.get_expected_dag_count() == 8
     for bad in ("six", "0", "-1"):
         monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_EXPECTED_DAG_COUNT", bad)
         with pytest.raises(AirflowException, match="upstream_expected_dag_count"):
             m.get_expected_dag_count()
+
+
+# --- upstream_dag_list (production) / upstream_expected_dag_count (testing) ---
+@pytest.mark.parametrize("raw, expected", [
+    (None, []),
+    ("", []),
+    ("   ", []),
+    ('["dag_a", "dag_b"]', ["dag_a", "dag_b"]),
+    ('[" dag_a ", "dag_b", "dag_a", ""]', ["dag_a", "dag_b"]),
+    ("dag_a, dag_b ,dag_c", ["dag_a", "dag_b", "dag_c"]),
+    ("dag_a\ndag_b", ["dag_a", "dag_b"]),
+    (["dag_a", "dag_b"], ["dag_a", "dag_b"]),
+])
+def test_parse_dag_list(raw, expected):
+    assert m.parse_dag_list(raw) == expected
+
+
+@pytest.mark.parametrize("raw", ['["dag_a", ', '{"dag_a": 1}'])
+def test_parse_dag_list_rejects_bad_json(raw):
+    with pytest.raises(AirflowException, match="upstream_dag_list"):
+        m.parse_dag_list(raw)
+
+
+def test_day_target_uses_list_when_set_else_count(airflow_db, monkeypatch):
+    monkeypatch.delenv("AIRFLOW_VAR_UPSTREAM_DAG_LIST", raising=False)
+    assert m.get_day_target() == 2  # testing default
+    monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_EXPECTED_DAG_COUNT", "4")
+    assert m.get_day_target() == 4
+    monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_DAG_LIST", '["dag_a", "dag_b", "dag_c"]')
+    assert m.get_day_target() == ["dag_a", "dag_b", "dag_c"]  # list wins over the count
+    monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_DAG_LIST", f'["dag_a", "{m.DAG_ID}"]')
+    with pytest.raises(AirflowException, match="must not contain"):
+        m.get_day_target()
+
+
+def test_list_mode_day_complete_only_when_all_listed_executed():
+    target = ["dag_a", "dag_b", "dag_c"]
+    state = m.DayState(succeeded=["dag_a"], failed=["dag_b"], running=["dag_c"])
+    assert not m.is_day_complete(state, target)
+    assert m.pending_dags(state, target) == ["dag_c"]
+
+    state = m.DayState(succeeded=["dag_a", "dag_c"], failed=["dag_b"])
+    assert m.is_day_complete(state, target)
+    assert m.pending_dags(state, target) == []
+
+
+def test_list_mode_ignores_dags_not_in_list():
+    target = ["dag_a", "dag_b"]
+    # Unlisted DAGs ready/running/finished do not change the outcome.
+    state = m.DayState(succeeded=["dag_a", "dag_b", "other_1"], running=["other_2"], ready=["other_3"])
+    assert m.is_day_complete(state, target)
+    # Executed unlisted DAGs do not count towards the list.
+    state = m.DayState(succeeded=["dag_a", "other_1", "other_2"])
+    assert not m.is_day_complete(state, target)
+    assert m.pending_dags(state, target) == ["dag_b"]
+
+
+def test_list_mode_triggers_only_listed_dags():
+    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=1), row("other", load_id=2), row("dag_b", load_id=3))
+    state = m.fetch_day_state(hook, RUN_DATE)
+    assert [e["dag_name"] for e in m.select_dags_to_trigger(state, allowed=["dag_a", "dag_b"])] == ["dag_a", "dag_b"]
+    assert sorted(e["dag_name"] for e in m.select_dags_to_trigger(state)) == ["dag_a", "dag_b", "other"]
 
 
 def test_update_status_sql_and_effect():
@@ -717,6 +780,7 @@ class World:
 
 def test_end_to_end_day(airflow_db, monkeypatch):
     names = [f"dag_{i}" for i in range(6)]
+    monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_EXPECTED_DAG_COUNT", "6")
     hook = FakeImpalaHook.with_rows(*[row(n, time=f"0{i}:00:00") for i, n in enumerate(names[:5])],
                                     row("dag_old", day="2026-10-10"))
     world = World(monkeypatch, hook)
@@ -813,3 +877,37 @@ def test_end_to_end_impala_down_fails_run(airflow_db, monkeypatch):
     assert states[("check_ready_list", -1)] == TaskInstanceState.UPSTREAM_FAILED
     assert world.triggered == []
     assert dag_run.state == DagRunState.FAILED
+
+
+def test_end_to_end_production_dag_list(airflow_db, monkeypatch):
+    monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_DAG_LIST", '["dag_a", "dag_b", "dag_c"]')
+    monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_EXPECTED_DAG_COUNT", "1")  # ignored while the list is set
+    hook = FakeImpalaHook.with_rows(row("dag_a", time="01:00:00"), row("not_listed", time="02:00:00"))
+    world = World(monkeypatch, hook)
+    world.outcome.update(dag_a="failed")
+
+    # 08:00 - only dag_a of the list is ready: it runs (and fails); the unlisted DAG is not triggered.
+    world.run("08:00")
+    assert world.triggered == ["dag_a"]
+    assert hook.status("dag_a") == m.STATUS_FAILED
+    assert hook.status("not_listed") == m.STATUS_READY
+
+    # 08:15 - dag_b and dag_c still to execute: keeps checking, runs the Spark job, triggers nothing.
+    cde_runs = world.cde_runs
+    dag_run, states = world.run("08:15")
+    assert states[("check_ready_list", -1)] == TaskInstanceState.SUCCESS
+    assert world.cde_runs == cde_runs + 1
+    assert world.triggered == ["dag_a"]
+
+    # 08:30 - dag_b and dag_c become READY and run.
+    hook.rows += [row("dag_b", time="08:20:00"), row("dag_c", time="08:25:00")]
+    world.run("08:30")
+    assert sorted(world.triggered) == ["dag_a", "dag_b", "dag_c"]
+    assert [hook.status(d) for d in ("dag_b", "dag_c")] == [m.STATUS_SUCCEEDED] * 2
+
+    # 08:45 - every listed DAG executed: loading is skipped for the rest of the day.
+    cde_runs = world.cde_runs
+    for hhmm in ("08:45", "09:00"):
+        dag_run, states = world.run(hhmm)
+        assert states[("check_ready_list", -1)] == TaskInstanceState.SKIPPED
+    assert world.cde_runs == cde_runs
