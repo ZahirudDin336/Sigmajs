@@ -166,6 +166,54 @@ def test_rerun_every_15_minutes_inserts_nothing_new(spark, tables):
     assert [(r.dataset_name, r.status) for r in log_rows(spark)] == [("ds1", "READY"), ("ds9", "READY")]
 
 
+def write_edw_table(spark, name, schema, column_types, rows):
+    (spark.createDataFrame(rows, schema).write.option("createTableColumnTypes", column_types)
+       .jdbc(DERBY_URL, name, mode="overwrite"))
+
+
+def test_production_source_query(spark, tables):
+    """Runs job.ready_list_query itself on Derby (only TRUNC(SYSDATE) is swapped for Derby's syntax)."""
+    write_edw_table(
+        spark, "UP_EDW.HLP_ADS_DATASETS_LOG_TEST",
+        "DATASET_NAME string, TABLENAME string, STATUS string, EXECUTION_DATE timestamp, INSERT_DT timestamp, "
+        "INSERT_LOAD_ID int",
+        "DATASET_NAME VARCHAR(64), TABLENAME VARCHAR(64), STATUS VARCHAR(16), EXECUTION_DATE TIMESTAMP, "
+        "INSERT_DT TIMESTAMP, INSERT_LOAD_ID INTEGER",
+        [
+            ("ds1", "t1", "READY", TODAY + timedelta(hours=1), NOW, 1),       # match
+            ("ds2", "t2", "READY", TODAY + timedelta(hours=1), NOW, 2),       # dataset INACTIVE
+            ("ds3", "t3", "READY", TODAY + timedelta(hours=1), NOW, 3),       # no mapping at all
+            ("ds4", "t4", "RUNNING", TODAY + timedelta(hours=1), NOW, 4),     # not READY
+            ("ds5", "t5", "READY", YESTERDAY + timedelta(hours=1), NOW, 5),   # yesterday
+            ("ds6", "t6", "READY", TODAY + timedelta(hours=2), NOW, 6),       # match, other DAG
+            ("ds1", "tX", "READY", TODAY + timedelta(hours=1), NOW, 7),       # same dataset, other table
+        ],
+    )
+    write_edw_table(
+        spark, "UP_EDW.HLP_ADS_DATASETS",
+        "DATASET_NAME string, SOURCE_TABLENAME string, AIRFLOW_DAG_NAME string, STATUS string",
+        "DATASET_NAME VARCHAR(64), SOURCE_TABLENAME VARCHAR(64), AIRFLOW_DAG_NAME VARCHAR(64), STATUS VARCHAR(16)",
+        [
+            ("ds1", "t1", "dag_a", "ACTIVE"),
+            ("ds1", "t1", "dag_old", "INACTIVE"),  # old mapping of the same table: must not duplicate
+            ("ds2", "t2", "dag_b", "INACTIVE"),
+            ("ds4", "t4", "dag_d", "ACTIVE"),
+            ("ds5", "t5", "dag_e", "ACTIVE"),
+            ("ds6", "t6", "dag_f", "ACTIVE"),
+        ],
+    )
+    derby_query = job.ready_list_query.replace("TRUNC(SYSDATE)", "TIMESTAMP(CURRENT_DATE, TIME('00:00:00'))")
+    assert derby_query != job.ready_list_query
+
+    extract = spark.read.jdbc(DERBY_URL, derby_query, properties={"driver": DERBY_DRIVER})
+    assert sorted((r.DATASET_NAME, r.TABLENAME, r.AIRFLOW_DAG_NAME) for r in extract.collect()) == [
+        ("ds1", "t1", "dag_a"), ("ds6", "t6", "dag_f")]
+
+    job.etl(spark_session=spark, source_query=derby_query, driver=DERBY_DRIVER)
+    assert [(r.dataset_name, r.dag_name, r.status, r.insert_load_id) for r in log_rows(spark)] == [
+        ("ds1", "dag_a", "READY", 1), ("ds6", "dag_f", "READY", 6)]
+
+
 def test_empty_source(spark, tables):
     write_source(spark, [])
     run_job(spark)

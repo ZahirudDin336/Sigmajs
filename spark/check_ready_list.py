@@ -19,21 +19,30 @@ UPSTREAM_TRIGGER_LOG = "dev_stg.upstream_trigger_log"
 STATUS_READY = "READY"
 ORACLE_DRIVER = "oracle.jdbc.driver.OracleDriver"
 
+# Today's READY loads of ACTIVE datasets, with the DAG to trigger.
+# * INNER JOIN: only loads that have an ACTIVE dataset mapping (the common
+#   values). HLP_ADS_DATASETS holds one ACTIVE row per (DATASET_NAME,
+#   SOURCE_TABLENAME), so the join never multiplies log rows.
+# * All filters are in WHERE and run in Oracle; EXECUTION_DATE is compared
+#   without a function on the column, so an index on it can be used.
 ready_list_query = """
-(	select
-	logs.DATASET_NAME,
-	logs.TABLENAME,
-	lists.AIRFLOW_DAG_NAME,
-	logs.STATUS,
-	logs.EXECUTION_DATE,
-	logs.INSERT_DT,
-	logs.INSERT_LOAD_ID
-	from
-	UP_EDW.HLP_ADS_DATASETS_LOG_TEST logs
-	LEFT JOIN UP_EDW.HLP_ADS_DATASETS lists
-	on lists.DATASET_NAME=logs.DATASET_NAME and lists.SOURCE_TABLENAME=logs.TABLENAME
-	and lists.STATUS='ACTIVE'
-	where logs.EXECUTION_DATE>=trunc(SYSDATE)
+(
+    SELECT logs.DATASET_NAME,
+           logs.TABLENAME,
+           lists.AIRFLOW_DAG_NAME,
+           logs.STATUS,
+           logs.EXECUTION_DATE,
+           logs.INSERT_DT,
+           logs.INSERT_LOAD_ID
+    FROM UP_EDW.HLP_ADS_DATASETS_LOG_TEST logs
+    JOIN UP_EDW.HLP_ADS_DATASETS lists
+      ON  lists.DATASET_NAME     = logs.DATASET_NAME
+      AND lists.SOURCE_TABLENAME = logs.TABLENAME
+    WHERE lists.STATUS = 'ACTIVE'
+      AND logs.STATUS  = 'READY'
+      AND logs.EXECUTION_DATE >= TRUNC(SYSDATE)
+      AND lists.AIRFLOW_DAG_NAME IS NOT NULL
+      AND logs.INSERT_LOAD_ID IS NOT NULL
 ) src
 """
 
