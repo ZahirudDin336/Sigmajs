@@ -77,10 +77,10 @@ def write_source(spark, rows):
        .jdbc(DERBY_URL, "SRC_LOG", mode="overwrite"))
 
 
-def add_log_row(spark, dataset, table, dag, status, ts):
+def add_log_row(spark, dataset, table, dag, status, ts, load_id=1):
     spark.sql(f"""
         INSERT INTO {job.UPSTREAM_TRIGGER_LOG} VALUES
-        ('{dataset}', '{table}', '{dag}', '{status}', NULL, TIMESTAMP'{ts}', 1, NULL, NULL)
+        ('{dataset}', '{table}', '{dag}', '{status}', NULL, TIMESTAMP'{ts}', {load_id}, NULL, NULL)
     """)
 
 
@@ -120,6 +120,37 @@ def test_inserts_one_ready_row_per_new_dataset(spark, tables):
         ("ds3", "SUCCEEDED"), ("ds4", "TRIGGERED")]
     # Staging table holds the full source extract.
     assert spark.table(job.BD_test_upstream_dly).count() == 6
+
+
+def test_same_load_and_execution_datetime_is_not_inserted_twice(spark, tables):
+    # A source row dated just before Spark's current_date() (Oracle's "today" and
+    # Spark's disagree around midnight) is invisible to the "already logged today"
+    # check; the insert_load_id + execution datetime check still finds it.
+    exec_dt = YESTERDAY + timedelta(hours=23, minutes=30)
+    write_source(spark, [
+        ("ds1", "t1", "dag_a", "SUCCESS", exec_dt, NOW, 7),
+        ("ds1", "t1", "dag_a", "SUCCESS", exec_dt, NOW, 7),  # exact duplicate in the source
+    ])
+    add_log_row(spark, "ds1", "t1", "dag_a", "SUCCEEDED", exec_dt, load_id=7)
+
+    run_job(spark)
+    run_job(spark)
+
+    assert [(r.dataset_name, r.insert_load_id, r.status) for r in log_rows(spark)] == [("ds1", 7, "SUCCEEDED")]
+
+
+def test_load_id_check_skips_only_the_same_load(spark, tables):
+    exec_dt = YESTERDAY + timedelta(hours=23, minutes=30)
+    write_source(spark, [
+        ("ds1", "t1", "dag_a", "SUCCESS", exec_dt, NOW, 8),  # new load of a logged dataset
+        ("ds2", "t2", "dag_b", "SUCCESS", exec_dt, NOW, 7),  # same load id, other dataset
+    ])
+    add_log_row(spark, "ds1", "t1", "dag_a", "SUCCEEDED", exec_dt, load_id=7)
+
+    run_job(spark)
+
+    assert sorted((r.dataset_name, r.insert_load_id, r.status) for r in log_rows(spark)) == [
+        ("ds1", 7, "SUCCEEDED"), ("ds1", 8, "READY"), ("ds2", 7, "READY")]
 
 
 def test_rerun_every_15_minutes_inserts_nothing_new(spark, tables):

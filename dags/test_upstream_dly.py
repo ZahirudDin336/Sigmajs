@@ -104,11 +104,24 @@ TODAY_FILTER = (
 
 REFRESH_SQL = f"REFRESH {TRIGGER_LOG_TABLE}"
 
+# Duplicate log entries CAN occur in the Impala log table, e.g. when:
+#   * the CDE job test_check_ready_list runs twice at the same time (a manual run
+#     in CDE next to the scheduled one): both see the row as new and insert it;
+#   * the dates differ around midnight: the source filters on Oracle's SYSDATE,
+#     the Spark job on its own current_date() (Spark session time zone) and the
+#     DAG on the Qatar date, so one side's "today" can miss the other's rows;
+#   * rows were inserted by hand or by an older version of the job.
+# A duplicate is a row with the same dag_name, insert_load_id and
+# source_insert_dt (the source EXECUTION_DATE). They are collapsed here (GROUP
+# BY) so a DAG is still triggered once and counted once against the expected
+# number of DAGs. All copies share the insert_load_id, so every status UPDATE
+# changes all copies together and they never drift apart.
 SELECT_DAY_STATE_SQL = f"""
-    SELECT dag_name, status, insert_load_id, source_insert_dt
+    SELECT dag_name, status, insert_load_id, source_insert_dt, COUNT(*) AS copies
     FROM {TRIGGER_LOG_TABLE}
     WHERE {TODAY_FILTER}
       AND dag_name IS NOT NULL
+    GROUP BY dag_name, status, insert_load_id, source_insert_dt
 """
 
 # Rows are addressed by insert_load_id, so every update touches exactly the
@@ -216,11 +229,14 @@ def fetch_day_state(hook: Any, run_date: str, exclude: Iterable[str] = ()) -> Da
     statuses: dict[str, set[str]] = {}
     first_seen: dict[str, Any] = {}
     state = DayState()
-    for dag_name, status, load_id, insert_dt in records:
+    for dag_name, status, load_id, insert_dt, copies in records:
         dag_name = (dag_name or "").strip()
         status = (status or "").strip().upper()
         if not dag_name or dag_name in excluded:
             continue
+        if copies and int(copies) > 1:
+            logger.warning("%s: %s duplicate %s rows (insert_load_id=%s, source_insert_dt=%s); treated as one",
+                           dag_name, copies, status, load_id, insert_dt)
         if load_id is None:
             logger.warning("Ignoring a %s row of %s without insert_load_id (cannot be updated uniquely)",
                            status, dag_name)

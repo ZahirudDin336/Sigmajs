@@ -61,8 +61,12 @@ class FakeImpalaHook:
             raise RuntimeError("impala unavailable")
         self.executed.append(_bind_parameters(sql, parameters))
         assert sql == m.SELECT_DAY_STATE_SQL
-        return [(r["dag_name"], r["status"], r["insert_load_id"], r["source_insert_dt"])
-                for r in self.rows if r["dag_name"] is not None and self._in_day(r, parameters)]
+        groups: dict[tuple, int] = {}
+        for r in self.rows:
+            if r["dag_name"] is not None and self._in_day(r, parameters):
+                key = (r["dag_name"], r["status"], r["insert_load_id"], r["source_insert_dt"])
+                groups[key] = groups.get(key, 0) + 1
+        return [(*key, copies) for key, copies in groups.items()]
 
     def run(self, sql, parameters=None):
         if self.fail_runs:

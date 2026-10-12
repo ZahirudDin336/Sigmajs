@@ -39,7 +39,16 @@ ready_list_query = """
 
 # One READY row per (dataset, table) and day: the latest load of the source
 # wins, rows without a mapped DAG or insert_load_id (the key the Airflow DAG
-# updates by) are skipped, rows already logged today are skipped. triggered_ts stays NULL until the Airflow DAG triggers the DAG.
+# updates by) are skipped, rows already logged today are skipped. triggered_ts
+# stays NULL until the Airflow DAG triggers the DAG.
+#
+# Duplicates: a load already in the log with the same insert_load_id and
+# execution datetime (source_insert_dt) for the same dataset/table is never
+# inserted again, even when the "already logged today" check misses it because
+# Oracle's SYSDATE, Spark's current_date() and the Qatar date disagree around
+# midnight (the look-back covers yesterday for that reason). Two runs of this
+# job at the same time can still both insert a row; the Airflow DAG collapses
+# such copies (same dag_name, insert_load_id, source_insert_dt) into one.
 INSERT_NEW_READY_SQL = f"""
 INSERT INTO {UPSTREAM_TRIGGER_LOG}
 (
@@ -76,8 +85,19 @@ LEFT JOIN (
 ) l
 ON o.dataset_name = l.dataset_name
 and o.tablename = l.source_tablename
+LEFT JOIN (
+    SELECT DISTINCT dataset_name, source_tablename, insert_load_id, source_insert_dt
+    FROM {UPSTREAM_TRIGGER_LOG}
+    WHERE source_insert_dt >= date_sub(current_date(), 1)
+      AND insert_load_id IS NOT NULL
+) k
+ON o.dataset_name = k.dataset_name
+and o.tablename = k.source_tablename
+and cast(o.insert_load_id as int) = k.insert_load_id
+and o.execution_date = k.source_insert_dt
 where o.rn = 1
 and l.dataset_name IS NULL
+and k.insert_load_id IS NULL
 """
 
 

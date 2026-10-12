@@ -33,5 +33,14 @@ TBLPROPERTIES (
 -- UPDATE dev_stg.upstream_trigger_log SET status = 'READY', updated_ts = now()
 -- WHERE dag_name = '<dag_id>' AND status = 'FAILED' AND source_insert_dt >= trunc(now(), 'DD');
 
+-- Find duplicate log entries (same DAG, insert_load_id and execution datetime):
+-- SELECT dag_name, insert_load_id, source_insert_dt, COUNT(*) AS copies,
+--        GROUP_CONCAT(DISTINCT status) AS statuses
+-- FROM dev_stg.upstream_trigger_log
+-- WHERE source_insert_dt >= trunc(now(), 'DD')
+-- GROUP BY dag_name, insert_load_id, source_insert_dt
+-- HAVING COUNT(*) > 1;
+-- The DAG treats such copies as one row and updates them together.
+
 -- Housekeeping (schedule periodically): merge-on-read UPDATEs create delete files.
 -- OPTIMIZE TABLE dev_stg.upstream_trigger_log;

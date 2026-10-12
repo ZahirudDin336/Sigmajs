@@ -149,6 +149,39 @@ def test_select_dags_to_trigger_respects_max_parallel(running, ready, expected):
     assert selected == [{"dag_name": f"r{i}", "insert_load_ids": [i]} for i in range(expected)]
 
 
+def test_duplicate_log_entries_are_collapsed(caplog):
+    dup = row("dag_a", load_id=11, time="08:00:00")
+    hook = FakeImpalaHook.with_rows(dup, dict(dup), dict(dup), row("dag_b", load_id=21))
+    state = m.fetch_day_state(hook, RUN_DATE)
+
+    assert state.ready == ["dag_a", "dag_b"]  # dag_a once, not three times
+    assert state.ids("dag_a", m.STATUS_READY) == [11]
+    assert m.select_dags_to_trigger(state)[0] == {"dag_name": "dag_a", "insert_load_ids": [11]}
+    assert "dag_a: 3 duplicate READY rows (insert_load_id=11, source_insert_dt=2026-10-11 08:00:00)" in caplog.text
+    select = " ".join(hook.executed[1].split())
+    assert "GROUP BY dag_name, status, insert_load_id, source_insert_dt" in select
+
+
+def test_duplicates_are_updated_together_and_counted_once():
+    dup = row("dag_a", load_id=11)
+    hook = FakeImpalaHook.with_rows(dup, dict(dup), *[row(f"dag_{i}", m.STATUS_SUCCEEDED) for i in range(5)])
+    assert m.trigger_and_wait(dag_name="dag_a", insert_load_ids=[11], run_date=RUN_DATE, parent_dag_id=m.DAG_ID,
+                              parent_run_id="p1", hook=hook, trigger=mock.Mock(return_value="r1"),
+                              wait=mock.Mock(return_value="success"), list_runs=lambda *_: []) == "success"
+    assert hook.statuses("dag_a") == [m.STATUS_SUCCEEDED, m.STATUS_SUCCEEDED]  # both copies
+    state = m.fetch_day_state(hook, RUN_DATE)
+    assert len(state.finished) == 6  # dag_a counted once
+    assert m.is_day_complete(state, 6)
+
+
+def test_same_load_id_other_execution_datetime_is_not_a_duplicate():
+    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=11, time="08:00:00"),
+                                    row("dag_a", load_id=11, time="09:00:00"))
+    state = m.fetch_day_state(hook, RUN_DATE)
+    assert state.ready == ["dag_a"]
+    assert state.ids("dag_a", m.STATUS_READY) == [11]
+
+
 def test_fetch_day_state_collects_insert_load_ids():
     hook = FakeImpalaHook.with_rows(
         row("dag_a", load_id=11), row("dag_a", load_id=12, dataset="ds2"),
