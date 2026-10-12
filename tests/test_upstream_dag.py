@@ -181,49 +181,6 @@ def test_is_day_complete(succeeded, failed, running, ready, complete):
     assert m.is_day_complete(state, 6) is complete
 
 
-def test_day_summary_counts_distinct_dags_despite_duplicates():
-    hook = FakeImpalaHook.with_rows(
-        row("dag_1", m.STATUS_SUCCEEDED, load_id=1), row("dag_1", m.STATUS_SUCCEEDED, load_id=1),  # exact dup
-        row("dag_2", m.STATUS_SUCCEEDED, load_id=2), row("dag_2", m.STATUS_SUCCEEDED, load_id=3, dataset="b"),
-        row("dag_3", m.STATUS_FAILED, load_id=4), row("dag_3", m.STATUS_READY, load_id=5, dataset="late"),
-        row("dag_4", " succeeded ", load_id=6),                                                     # dirty status
-        row("dag_5 ", m.STATUS_SUCCEEDED, load_id=7), row("dag_5", m.STATUS_SUCCEEDED, load_id=8),   # stray space
-        row("dag_6", m.STATUS_FAILED, load_id=9),
-        row("dag_7", m.STATUS_SUCCEEDED, day="2026-10-10", load_id=10),                             # yesterday
-        row(m.DAG_ID, m.STATUS_SUCCEEDED, load_id=11),                                              # itself
-    )
-    assert len([r for r in hook.rows if r["source_insert_dt"].startswith(RUN_DATE)]) == 11
-
-    state = m.fetch_day_summary(hook, RUN_DATE, exclude=[m.DAG_ID])
-
-    assert state.succeeded == ["dag_1", "dag_2", "dag_4", "dag_5"]
-    assert state.failed == ["dag_3", "dag_6"]
-    assert state.ready == [] and state.running == []
-    assert len(state.finished) == 6
-    assert m.is_day_complete(state, 6)
-    sql = " ".join(hook.executed[-1].split())
-    assert "GROUP BY dag_name" in sql
-    assert "source_insert_dt >= CAST('2026-10-11 00:00:00' AS TIMESTAMP)" in sql
-
-
-def test_day_summary_running_duplicate_keeps_day_open():
-    hook = FakeImpalaHook.with_rows(
-        *[row(f"dag_{i}", m.STATUS_SUCCEEDED) for i in range(6)],
-        row("dag_0", m.STATUS_TRIGGERED, dataset="rerun"),  # dag_0 is running again
-    )
-    state = m.fetch_day_summary(hook, RUN_DATE)
-    assert state.running == ["dag_0"]
-    assert len(state.finished) == 5
-    assert not m.is_day_complete(state, 6)
-
-
-def test_day_state_reports_duplicate_rows(caplog):
-    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=1), row("dag_a", load_id=1))
-    state = m.fetch_day_state(hook, RUN_DATE)
-    assert state.ids("dag_a", m.STATUS_READY) == [1]
-    assert "2 duplicate READY rows with insert_load_id=1" in caplog.text
-
-
 def test_expected_dag_count_default_and_variable(airflow_db, monkeypatch):
     assert m.get_expected_dag_count() == 6
     monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_EXPECTED_DAG_COUNT", "8")
@@ -760,9 +717,7 @@ def test_end_to_end_day(airflow_db, monkeypatch):
     assert hook.status("dag_5") == m.STATUS_SUCCEEDED
     assert sorted(world.triggered) == names
 
-    # 08:45 - all six finished (plus duplicate rows): run stops early, no Spark job, until tomorrow.
-    hook.rows.append(dict(hook.rows[0]))
-    hook.rows.append(row("dag_1", m.STATUS_SUCCEEDED, dataset="second_dataset"))
+    # 08:45 - all six finished: run stops early, no Spark job, until tomorrow.
     cde_runs = world.cde_runs
     for hhmm in ("08:45", "09:00"):
         dag_run, states = world.run(hhmm)

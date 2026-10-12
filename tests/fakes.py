@@ -60,21 +60,9 @@ class FakeImpalaHook:
             self.fail_selects -= 1
             raise RuntimeError("impala unavailable")
         self.executed.append(_bind_parameters(sql, parameters))
-        rows = [r for r in self.rows
-                if r["dag_name"] is not None and r["dag_name"].strip() and self._in_day(r, parameters)]
-        if sql == m.SELECT_DAY_STATE_SQL:
-            groups: dict[tuple, list] = {}
-            for r in rows:
-                key = (r["dag_name"].strip(), r["status"].strip().upper(), r["insert_load_id"])
-                groups.setdefault(key, []).append(r["source_insert_dt"])
-            return [(*key, min(dts), len(dts)) for key, dts in groups.items()]
-        assert sql == m.SELECT_DAY_SUMMARY_SQL, sql
-        rank = {m.STATUS_TRIGGERED: 4, m.STATUS_FAILED: 3, m.STATUS_SUCCEEDED: 2, m.STATUS_READY: 1}
-        names = {4: m.STATUS_TRIGGERED, 3: m.STATUS_FAILED, 2: m.STATUS_SUCCEEDED, 1: m.STATUS_READY}
-        summary: dict[str, list] = {}
-        for r in rows:
-            summary.setdefault(r["dag_name"].strip(), []).append(rank.get(r["status"].strip().upper(), 0))
-        return [(dag, names.get(max(ranks), "UNKNOWN"), len(ranks)) for dag, ranks in summary.items()]
+        assert sql == m.SELECT_DAY_STATE_SQL
+        return [(r["dag_name"], r["status"], r["insert_load_id"], r["source_insert_dt"])
+                for r in self.rows if r["dag_name"] is not None and self._in_day(r, parameters)]
 
     def run(self, sql, parameters=None):
         if self.fail_runs:

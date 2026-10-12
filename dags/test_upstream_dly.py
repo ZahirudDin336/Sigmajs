@@ -105,44 +105,10 @@ TODAY_FILTER = (
 REFRESH_SQL = f"REFRESH {TRIGGER_LOG_TABLE}"
 
 SELECT_DAY_STATE_SQL = f"""
-    SELECT TRIM(dag_name) AS dag_name, UPPER(TRIM(status)) AS status, insert_load_id,
-           MIN(source_insert_dt) AS first_insert_dt, COUNT(*) AS row_count
+    SELECT dag_name, status, insert_load_id, source_insert_dt
     FROM {TRIGGER_LOG_TABLE}
     WHERE {TODAY_FILTER}
       AND dag_name IS NOT NULL
-      AND TRIM(dag_name) <> ''
-    GROUP BY TRIM(dag_name), UPPER(TRIM(status)), insert_load_id
-"""
-
-# One row per DISTINCT DAG of the day with its effective status, used to compare
-# the number of finished DAGs with upstream_expected_dag_count. Duplicate rows
-# (same DAG loaded twice, several datasets for one DAG, stray spaces or case in
-# status) collapse into one DAG. Precedence: TRIGGERED > FAILED > SUCCEEDED > READY.
-SELECT_DAY_SUMMARY_SQL = f"""
-    SELECT dag_name,
-           CASE MAX(status_rank)
-               WHEN 4 THEN '{STATUS_TRIGGERED}'
-               WHEN 3 THEN '{STATUS_FAILED}'
-               WHEN 2 THEN '{STATUS_SUCCEEDED}'
-               WHEN 1 THEN '{STATUS_READY}'
-               ELSE 'UNKNOWN'
-           END AS dag_status,
-           COUNT(*) AS row_count
-    FROM (
-        SELECT TRIM(dag_name) AS dag_name,
-               CASE UPPER(TRIM(status))
-                   WHEN '{STATUS_TRIGGERED}' THEN 4
-                   WHEN '{STATUS_FAILED}' THEN 3
-                   WHEN '{STATUS_SUCCEEDED}' THEN 2
-                   WHEN '{STATUS_READY}' THEN 1
-                   ELSE 0
-               END AS status_rank
-        FROM {TRIGGER_LOG_TABLE}
-        WHERE {TODAY_FILTER}
-          AND dag_name IS NOT NULL
-          AND TRIM(dag_name) <> ''
-    ) rows_of_day
-    GROUP BY dag_name
 """
 
 # Rows are addressed by insert_load_id, so every update touches exactly the
@@ -250,14 +216,11 @@ def fetch_day_state(hook: Any, run_date: str, exclude: Iterable[str] = ()) -> Da
     statuses: dict[str, set[str]] = {}
     first_seen: dict[str, Any] = {}
     state = DayState()
-    for dag_name, status, load_id, insert_dt, row_count in records:
+    for dag_name, status, load_id, insert_dt in records:
         dag_name = (dag_name or "").strip()
         status = (status or "").strip().upper()
         if not dag_name or dag_name in excluded:
             continue
-        if row_count and int(row_count) > 1:
-            logger.warning("%s has %s duplicate %s rows with insert_load_id=%s; treated as one",
-                           dag_name, row_count, status, load_id)
         if load_id is None:
             logger.warning("Ignoring a %s row of %s without insert_load_id (cannot be updated uniquely)",
                            status, dag_name)
@@ -279,29 +242,6 @@ def fetch_day_state(hook: Any, run_date: str, exclude: Iterable[str] = ()) -> Da
             state.ready.append(dag_name)
         else:
             logger.warning("Ignoring %s with unknown status(es) %s", dag_name, sorted(dag_statuses))
-    return state
-
-
-def fetch_day_summary(hook: Any, run_date: str, exclude: Iterable[str] = ()) -> DayState:
-    """Distinct DAGs of the day with their effective status, deduplicated in Impala.
-
-    Used to compare the number of finished DAGs with the expected count.
-    """
-    run_impala(hook, REFRESH_SQL)
-    records = run_impala(hook, SELECT_DAY_SUMMARY_SQL, day_bounds(run_date), fetch=True)
-    excluded = set(exclude)
-    buckets = {STATUS_READY: "ready", STATUS_TRIGGERED: "running",
-               STATUS_SUCCEEDED: "succeeded", STATUS_FAILED: "failed"}
-    state = DayState()
-    for dag_name, dag_status, row_count in sorted(records, key=lambda r: str(r[0])):
-        if dag_name in excluded:
-            continue
-        if int(row_count or 0) > 1:
-            logger.info("%s has %s rows today; counted once as %s", dag_name, row_count, dag_status)
-        if dag_status not in buckets:
-            logger.warning("Ignoring %s with unknown status %s", dag_name, dag_status)
-            continue
-        getattr(state, buckets[dag_status]).append(dag_name)
     return state
 
 
@@ -622,9 +562,7 @@ with DAG(
     @task.short_circuit(max_active_tis_per_dag=1)
     def check_day_pending(run_date: str) -> bool:
         expected = get_expected_dag_count()
-        state = fetch_day_summary(get_impala_hook(), run_date, exclude=[DAG_ID])
-        logger.info("%s: %s distinct DAG(s): finished=%s running=%s ready=%s", run_date,
-                    len(state.finished + state.running + state.ready), state.finished, state.running, state.ready)
+        state = fetch_day_state(get_impala_hook(), run_date, exclude=[DAG_ID])
         if is_day_complete(state, expected):
             logger.info(
                 "All %s expected DAG(s) finished for %s (succeeded=%s, failed=%s); "
