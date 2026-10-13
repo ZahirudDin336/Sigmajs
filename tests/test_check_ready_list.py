@@ -6,6 +6,7 @@ Spark's JDBC reader (Derby ships with Spark).
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -24,7 +25,7 @@ SOURCE_COLUMNS = (
     "DATASET_NAME VARCHAR(64), TABLENAME VARCHAR(64), AIRFLOW_DAG_NAME VARCHAR(64), STATUS VARCHAR(16), "
     "EXECUTION_DATE TIMESTAMP, INSERT_DT TIMESTAMP, INSERT_LOAD_ID INTEGER"
 )
-NOW = datetime.now().replace(microsecond=0)
+NOW = datetime.now(ZoneInfo("Asia/Qatar")).replace(tzinfo=None, microsecond=0)  # Qatar wall clock
 TODAY = NOW.replace(hour=0, minute=0, second=0)
 YESTERDAY = TODAY - timedelta(days=1)
 
@@ -37,6 +38,7 @@ def spark(tmp_path_factory):
         .master("local[2]")
         .config("spark.ui.enabled", "false")
         .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.warehouse.dir", str(base / "warehouse"))
         .config("spark.hadoop.javax.jdo.option.ConnectionURL",
                 f"jdbc:derby:;databaseName={base / 'metastore_db'};create=true")
@@ -51,7 +53,7 @@ def spark(tmp_path_factory):
 @pytest.fixture
 def tables(spark):
     spark.sql(f"DROP TABLE IF EXISTS {job.UPSTREAM_TRIGGER_LOG}")
-    spark.sql(f"DROP TABLE IF EXISTS {job.BD_test_upstream_dly}")
+    spark.catalog.dropTempView(job.SOURCE_VIEW)
     spark.sql(f"""
         CREATE TABLE {job.UPSTREAM_TRIGGER_LOG} (
             dataset_name STRING, source_tablename STRING, dag_name STRING, status STRING,
@@ -118,8 +120,9 @@ def test_inserts_one_ready_row_per_new_dataset(spark, tables):
     # Existing rows untouched.
     assert [(r.dataset_name, r.status) for r in rows if r.status != "READY"] == [
         ("ds3", "SUCCEEDED"), ("ds4", "TRIGGERED")]
-    # Staging table holds the full source extract.
-    assert spark.table(job.BD_test_upstream_dly).count() == 6
+    # The source extract is a temporary view, not a table.
+    assert spark.table(job.SOURCE_VIEW).count() == 6
+    assert not spark.catalog.tableExists("dev_stg.tmp_upstream_list_dly")
 
 
 def test_same_load_and_execution_datetime_is_not_inserted_twice(spark, tables):
@@ -202,7 +205,7 @@ def test_production_source_query(spark, tables):
             ("ds6", "t6", "dag_f", "ACTIVE"),
         ],
     )
-    derby_query = job.ready_list_query.replace("TRUNC(SYSDATE)", "TIMESTAMP(CURRENT_DATE, TIME('00:00:00'))")
+    derby_query = job.ready_list_query.replace("TRUNC(SYSDATE)", f"TIMESTAMP('{TODAY}')")
     assert derby_query != job.ready_list_query
 
     extract = spark.read.jdbc(DERBY_URL, derby_query, properties={"driver": DERBY_DRIVER})
@@ -225,7 +228,7 @@ def test_missing_conf_fails_before_any_write(spark, tables, key):
     spark.conf.unset(key)
     with pytest.raises(ValueError, match=key):
         run_job(spark)
-    assert not spark.catalog.tableExists(job.BD_test_upstream_dly)
+    assert not spark.catalog.tableExists(job.SOURCE_VIEW)
 
 
 def test_source_error_is_raised(spark, tables):
@@ -233,7 +236,41 @@ def test_source_error_is_raised(spark, tables):
         job.etl(spark_session=spark, source_query="(SELECT * FROM NO_SUCH_TABLE) src", driver=DERBY_DRIVER)
 
 
-def test_session_builder_sets_timestamp_flag():
+def test_session_builder_settings():
     import inspect
 
-    assert "spark.sql.iceberg.handle-timestamp-without-timezone" in inspect.getsource(job.build_spark_session)
+    source = inspect.getsource(job.build_spark_session)
+    assert "spark.sql.iceberg.handle-timestamp-without-timezone" in source
+    assert '"spark.sql.session.timeZone", "UTC"' in source
+    for oversized in ("spark.executor.memory", "spark.driver.memory", "memoryOverhead", "JavaSerializer"):
+        assert oversized not in source  # resources come from the CDE job / Airflow overrides
+
+
+def test_updated_ts_is_qatar_wall_clock(spark, tables):
+    write_source(spark, [("ds1", "t1", "dag_a", "SUCCESS", TODAY + timedelta(hours=1), NOW, 1)])
+    run_job(spark)
+    (row,) = log_rows(spark)
+    assert abs((row.updated_ts - NOW).total_seconds()) < 300
+
+
+def test_password_file_replaces_password(spark, tables, tmp_path):
+    secret = tmp_path / "edw.pw"
+    secret.write_text("app\n")
+    spark.conf.set("spark.edw_password", "")
+    spark.conf.set("spark.edw_password_file", str(secret))
+    try:
+        assert job.get_edw_config(spark) == (DERBY_URL, "app", "app")
+        write_source(spark, [("ds1", "t1", "dag_a", "SUCCESS", TODAY + timedelta(hours=1), NOW, 1)])
+        run_job(spark)
+        assert len(log_rows(spark)) == 1
+    finally:
+        spark.conf.unset("spark.edw_password_file")
+
+
+def test_missing_password_file_fails(spark, tables, tmp_path):
+    spark.conf.set("spark.edw_password_file", str(tmp_path / "missing"))
+    try:
+        with pytest.raises(FileNotFoundError):
+            run_job(spark)
+    finally:
+        spark.conf.unset("spark.edw_password_file")

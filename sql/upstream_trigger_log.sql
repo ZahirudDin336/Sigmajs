@@ -30,8 +30,9 @@ TBLPROPERTIES (
 -- ALTER TABLE dev_stg.upstream_trigger_log SET TBLPROPERTIES ('format-version'='2');
 
 -- Re-run a FAILED DAG the same day: set its rows back to READY, e.g.
--- UPDATE dev_stg.upstream_trigger_log SET status = 'READY', updated_ts = now()
--- WHERE dag_name = '<dag_id>' AND status = 'FAILED' AND source_insert_dt >= trunc(now(), 'DD');
+-- UPDATE dev_stg.upstream_trigger_log SET status = 'READY', updated_ts = from_utc_timestamp(utc_timestamp(), 'Asia/Qatar')
+-- WHERE dag_name = '<dag_id>' AND status = 'FAILED'
+--   AND source_insert_dt >= trunc(from_utc_timestamp(utc_timestamp(), 'Asia/Qatar'), 'DD');
 
 -- Find duplicate log entries (same DAG, insert_load_id and execution datetime):
 -- SELECT dag_name, insert_load_id, source_insert_dt, COUNT(*) AS copies,
@@ -42,5 +43,4 @@ TBLPROPERTIES (
 -- HAVING COUNT(*) > 1;
 -- The DAG treats such copies as one row and updates them together.
 
--- Housekeeping (schedule periodically): merge-on-read UPDATEs create delete files.
--- OPTIMIZE TABLE dev_stg.upstream_trigger_log;
+-- Housekeeping runs daily in DAG test_upstream_dly_maintenance (OPTIMIZE TABLE + expire_snapshots).

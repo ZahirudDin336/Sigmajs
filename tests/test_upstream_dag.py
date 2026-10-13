@@ -7,7 +7,7 @@ from unittest import mock
 import pendulum
 import pytest
 import test_upstream_dly as m
-from airflow.exceptions import AirflowException
+from airflow.exceptions import AirflowException, AirflowSkipException
 from airflow.utils.state import DagRunState, TaskInstanceState
 from airflow.utils.trigger_rule import TriggerRule
 from fakes import NOW, FakeImpalaHook
@@ -54,20 +54,29 @@ def test_dag_runs_every_15_minutes_in_qatar_time():
 
 def test_task_order():
     chain = ["start", "reconcile_triggered", "check_day_pending", "validate_edw_connection",
-             "check_ready_list", "get_dags_to_trigger", "trigger_upstream_dag", "end"]
+             "check_ready_list", "get_dags_to_trigger", "run_upstream_dag", "end"]
     assert set(m.dag.task_ids) == set(chain)
     for upstream, downstream in itertools.pairwise(chain):
         assert m.dag.get_task(upstream).downstream_task_ids == {downstream}
 
 
-def test_trigger_task_is_mapped_with_max_six_in_parallel():
+def test_upstream_dags_wait_in_reschedule_mode():
     from airflow.models.mappedoperator import MappedOperator
 
-    trigger = m.dag.get_task("trigger_upstream_dag")
-    assert isinstance(trigger, MappedOperator)
-    # Across ALL master runs, not just one.
-    assert trigger.partial_kwargs["max_active_tis_per_dag"] == 6
-    assert trigger.partial_kwargs["execution_timeout"] > m.CHILD_DAG_TIMEOUT
+    sensor = m.dag.get_task("run_upstream_dag")
+    assert isinstance(sensor, MappedOperator)
+    kwargs = sensor.partial_kwargs
+    assert kwargs["mode"] == "reschedule"  # no worker slot held between checks
+    assert kwargs["poke_interval"] == 60
+    assert kwargs["timeout"] == m.CHILD_DAG_TIMEOUT.total_seconds()
+    assert kwargs["max_active_tis_per_dag"] == 1  # checks run one at a time: the 6-slot gate is exact
+    assert kwargs["execution_timeout"] == m.TASK_TIMEOUT
+
+
+def test_map_index_template_only_on_airflow_2_9_plus(monkeypatch):
+    from packaging.version import Version
+
+    assert ("map_index_template" in m.MAP_INDEX_KWARGS) == (Version(m.AIRFLOW_VERSION).release >= (2, 9))
 
 
 def test_steps_never_run_twice_at_once():
@@ -75,21 +84,24 @@ def test_steps_never_run_twice_at_once():
         assert m.dag.get_task(task_id).max_active_tis_per_dag == 1, task_id
 
 
-def test_timeouts_and_trigger_rules():
+def test_timeouts_trigger_rules_and_alerts():
     assert m.dag.get_task("end").trigger_rule == TriggerRule.NONE_FAILED
     for task in m.dag.tasks:
-        timeout = task.partial_kwargs.get("execution_timeout") if task.task_id == "trigger_upstream_dag" \
-            else task.execution_timeout
-        assert timeout is not None, task.task_id
+        if task.task_id == "run_upstream_dag":
+            continue
+        assert task.execution_timeout is not None, task.task_id
+        assert task.on_failure_callback is not None or task.on_failure_callback == [], task.task_id
     cde = m.dag.get_task("check_ready_list")
     assert cde.timeout == m.CDE_JOB_TIMEOUT_SECONDS
+    assert cde.job_poll_interval == m.CDE_POLL_SECONDS
     assert cde.execution_timeout.total_seconds() > m.CDE_JOB_TIMEOUT_SECONDS
+    assert m.default_args["on_failure_callback"] is m.notify_failure
 
 
 def test_cde_overrides_render(airflow_db, edw_conn):
     from airflow.models import TaskInstance
 
-    task = m.dag.get_task("check_ready_list")
+    task = m.dag.get_task("check_ready_list").prepare_for_execution()  # copy: rendering mutates
     start = pendulum.datetime(2026, 10, 10, 20, 45, tz="UTC")  # 23:45 Qatar
     dag_run = m.dag.create_dagrun(run_id="render_test", state=DagRunState.RUNNING, execution_date=start,
                                   data_interval=(start, start.add(minutes=15)))
@@ -97,13 +109,54 @@ def test_cde_overrides_render(airflow_db, edw_conn):
     ti.dag_run = dag_run
     ti.render_templates()
 
-    assert ti.task.overrides["spark"]["conf"] == {
+    spark = ti.task.overrides["spark"]
+    assert spark["conf"] == {
+        "spark.dynamicAllocation.maxExecutors": "2",
         "spark.edw_jdbc_url": "jdbc:oracle:thin:@edw:1521/EDW",
         "spark.edw_username": "edw_user",
         "spark.edw_password": "s3cret",
+        "spark.edw_password_file": "",
         "spark.curr_date": RUN_DATE,  # interval ends at 00:00 Qatar on the 11th
     }
+    assert {k: spark[k] for k in m.SPARK_RESOURCES} == m.SPARK_RESOURCES
     assert ti.task.job_name == "test_check_ready_list"
+
+
+def test_cde_overrides_use_password_file_when_configured(airflow_db, edw_conn, monkeypatch):
+    from airflow.models import TaskInstance
+
+    monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_EDW_PASSWORD_FILE", "/app/mount/edw-secret/password")
+    start = pendulum.datetime(2026, 10, 11, 5, 0, tz="UTC")
+    dag_run = m.dag.create_dagrun(run_id="render_pw_file", state=DagRunState.RUNNING, execution_date=start,
+                                  data_interval=(start, start.add(minutes=15)))
+    ti = TaskInstance(m.dag.get_task("check_ready_list").prepare_for_execution(), run_id=dag_run.run_id)
+    ti.dag_run = dag_run
+    ti.render_templates()
+    conf = ti.task.overrides["spark"]["conf"]
+    assert conf["spark.edw_password"] == ""  # not sent when a file is used
+    assert conf["spark.edw_password_file"] == "/app/mount/edw-secret/password"
+
+
+def test_notify_failure_logs_and_emails(airflow_db, monkeypatch, caplog):
+    ti = mock.Mock(dag_id=m.DAG_ID, task_id="run_upstream_dag", map_index=2, log_url="http://log")
+    context = {"task_instance": ti, "run_id": "scheduled__x", "exception": RuntimeError("boom")}
+    with mock.patch("airflow.utils.email.send_email") as send:
+        m.notify_failure(context)
+        send.assert_not_called()  # no recipients configured
+        monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_ALERT_EMAILS", "ops@example.com, dev@example.com")
+        m.notify_failure(context)
+    (recipients, subject, body), _ = send.call_args
+    assert recipients == ["ops@example.com", "dev@example.com"]
+    assert subject == "[Airflow] test_upstream_dly.run_upstream_dag failed (scheduled__x)"
+    assert "boom" in body
+    assert "run_upstream_dag failed" in caplog.text
+
+
+def test_notify_failure_never_raises(airflow_db, monkeypatch):
+    monkeypatch.setenv("AIRFLOW_VAR_UPSTREAM_ALERT_EMAILS", "ops@example.com")
+    ti = mock.Mock(dag_id=m.DAG_ID, task_id="t", map_index=-1, log_url="")
+    with mock.patch("airflow.utils.email.send_email", side_effect=OSError("no SMTP")):
+        m.notify_failure({"task_instance": ti, "run_id": "r", "exception": None})
 
 
 # --------------------------------------------------------------------------- #
@@ -165,9 +218,8 @@ def test_duplicate_log_entries_are_collapsed(caplog):
 def test_duplicates_are_updated_together_and_counted_once():
     dup = row("dag_a", load_id=11)
     hook = FakeImpalaHook.with_rows(dup, dict(dup), *[row(f"dag_{i}", m.STATUS_SUCCEEDED) for i in range(5)])
-    assert m.trigger_and_wait(dag_name="dag_a", insert_load_ids=[11], run_date=RUN_DATE, parent_dag_id=m.DAG_ID,
-                              parent_run_id="p1", hook=hook, trigger=mock.Mock(return_value="r1"),
-                              wait=mock.Mock(return_value="success"), list_runs=lambda *_: []) == "success"
+    m.update_status(hook, dag_name="dag_a", run_date=RUN_DATE, status=m.STATUS_SUCCEEDED,
+                    from_statuses=[m.STATUS_READY], insert_load_ids=[11])
     assert hook.statuses("dag_a") == [m.STATUS_SUCCEEDED, m.STATUS_SUCCEEDED]  # both copies
     state = m.fetch_day_state(hook, RUN_DATE)
     assert len(state.finished) == 6  # dag_a counted once
@@ -237,13 +289,13 @@ def test_expected_dag_count_default_and_variable(airflow_db, monkeypatch):
     (["dag_a", "dag_b"], ["dag_a", "dag_b"]),
 ])
 def test_parse_dag_list(raw, expected):
-    assert m.parse_dag_list(raw) == expected
+    assert m.parse_name_list(raw) == expected
 
 
 @pytest.mark.parametrize("raw", ['["dag_a", ', '{"dag_a": 1}'])
 def test_parse_dag_list_rejects_bad_json(raw):
     with pytest.raises(AirflowException, match="upstream_dag_list"):
-        m.parse_dag_list(raw)
+        m.parse_name_list(raw)
 
 
 def test_day_target_uses_list_when_set_else_count(airflow_db, monkeypatch):
@@ -294,7 +346,7 @@ def test_update_status_sql_and_effect():
                     from_statuses=[m.STATUS_READY], insert_load_ids=[12, 11, 12], set_triggered_ts=True)
     sql = " ".join(hook.executed[0].split())
     assert sql == ("UPDATE dev_stg.upstream_trigger_log SET status = 'TRIGGERED', "
-                   "triggered_ts = now(), updated_ts = now() WHERE insert_load_id IN (11, 12) "
+                   f"triggered_ts = {m.NOW_QATAR}, updated_ts = {m.NOW_QATAR} WHERE insert_load_id IN (11, 12) "
                    "AND dag_name = 'dag_a' AND status IN ('READY') "
                    "AND source_insert_dt >= CAST('2026-10-11 00:00:00' AS TIMESTAMP) "
                    "AND source_insert_dt < CAST('2026-10-12 00:00:00' AS TIMESTAMP)")
@@ -318,7 +370,7 @@ def test_final_status_update_sets_updated_ts_only():
     m.update_status(hook, dag_name="dag_a", run_date=RUN_DATE, status=m.STATUS_SUCCEEDED,
                     from_statuses=[m.STATUS_TRIGGERED], insert_load_ids=hook.load_ids("dag_a"))
     sql = " ".join(hook.executed[0].split())
-    assert "SET status = 'SUCCEEDED', updated_ts = now()" in sql
+    assert f"SET status = 'SUCCEEDED', updated_ts = {m.NOW_QATAR}" in sql
     assert "triggered_ts" not in sql
     assert hook.rows[0]["updated_ts"] == NOW and hook.rows[0]["triggered_ts"] is None
 
@@ -371,7 +423,7 @@ def test_authorization_error_on_read_fails_before_anything_is_triggered(airflow_
     world = World(monkeypatch, hook)
     dag_run, states = world.run("13:00")
     assert states[("reconcile_triggered", -1)] == TaskInstanceState.FAILED
-    assert states[("trigger_upstream_dag", -1)] == TaskInstanceState.UPSTREAM_FAILED
+    assert states[("run_upstream_dag", -1)] == TaskInstanceState.UPSTREAM_FAILED
     assert world.triggered == []
     assert world.cde_runs == 0
 
@@ -393,62 +445,78 @@ def test_validate_edw_connection_config():
 
 
 # --------------------------------------------------------------------------- #
-# trigger_and_wait
+# poke_upstream_dag: one sensor check
 # --------------------------------------------------------------------------- #
 CHILD_RUN_1 = f"upstream__{RUN_DATE}__1"
 
 
-def _run(hook, trigger=None, wait=None, existing=(), parent_run_id="scheduled__1", load_ids=None):
-    return m.trigger_and_wait(
+def _poke(hook, runs=(), trigger=None, active=0, parent_run_id="scheduled__1", load_ids=None):
+    return m.poke_upstream_dag(
         dag_name="dag_a", insert_load_ids=hook.load_ids("dag_a") if load_ids is None else load_ids,
         run_date=RUN_DATE, parent_dag_id=m.DAG_ID, parent_run_id=parent_run_id, hook=hook,
         trigger=trigger or mock.Mock(return_value=CHILD_RUN_1),
-        wait=wait or mock.Mock(return_value="success"),
-        list_runs=lambda *_: list(existing),
+        list_runs=lambda *_: list(runs), count_active=lambda: active,
     )
 
 
-def test_success_waits_then_marks_succeeded():
-    hook = FakeImpalaHook.with_rows(row("dag_a"), row("dag_a", dataset="ds2"))
+def mine(state):
+    return m.ChildRun(CHILD_RUN_1, state, "scheduled__1")
+
+
+def test_first_check_triggers_and_marks_triggered():
+    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=11), row("dag_a", load_id=12, dataset="ds2"))
     trigger = mock.Mock(return_value=CHILD_RUN_1)
-    seen = []
-
-    def wait(dag_id, run_id):
-        seen.append((run_id, hook.statuses("dag_a")))
-        return "success"
-
-    assert _run(hook, trigger, wait) == "success"
+    assert _poke(hook, trigger=trigger) is None  # check again later
     trigger.assert_called_once_with(
         "dag_a", CHILD_RUN_1,
         conf={"run_date": RUN_DATE, "parent_dag_id": m.DAG_ID, "parent_run_id": "scheduled__1",
-              "insert_load_ids": hook.load_ids("dag_a")},
+              "insert_load_ids": [11, 12]},
     )
-    # TRIGGERED while waiting, SUCCEEDED after.
-    assert seen == [(CHILD_RUN_1, [m.STATUS_TRIGGERED, m.STATUS_TRIGGERED])]
-    assert hook.statuses("dag_a") == [m.STATUS_SUCCEEDED, m.STATUS_SUCCEEDED]
+    assert hook.statuses("dag_a") == [m.STATUS_TRIGGERED, m.STATUS_TRIGGERED]
     assert all(r["triggered_ts"] == NOW and r["updated_ts"] == NOW for r in hook.rows)
-    final_sql = " ".join(hook.executed[-1].split())
-    assert "SET status = 'SUCCEEDED', updated_ts = now()" in final_sql
 
 
-def test_child_failure_marks_failed_and_raises():
-    hook = FakeImpalaHook.with_rows(row("dag_a"))
-    with pytest.raises(AirflowException, match="finished as failed"):
-        _run(hook, wait=mock.Mock(return_value="failed"))
+@pytest.mark.parametrize("state", ["queued", "running"])
+def test_running_dag_is_checked_again_later(state):
+    hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_TRIGGERED))
+    trigger = mock.Mock()
+    assert _poke(hook, runs=[mine(state)], trigger=trigger) is None
+    trigger.assert_not_called()
+    assert hook.executed == []  # no Impala traffic while waiting
+
+
+def test_success_marks_succeeded():
+    hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_TRIGGERED))
+    assert _poke(hook, runs=[mine("success")]) == "success"
+    assert hook.status("dag_a") == m.STATUS_SUCCEEDED
+    assert f"SET status = 'SUCCEEDED', updated_ts = {m.NOW_QATAR}" in " ".join(hook.executed[-1].split())
+
+
+def test_failure_marks_failed_and_fails_the_task():
+    hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_TRIGGERED))
+    with pytest.raises(AirflowException, match="failed"):
+        _poke(hook, runs=[mine("failed")])
     assert hook.status("dag_a") == m.STATUS_FAILED
     assert hook.rows[0]["updated_ts"] == NOW
-    assert "SET status = 'FAILED', updated_ts = now()" in " ".join(hook.executed[-1].split())
 
 
-@pytest.mark.parametrize("error", ["DAG 'dag_a' does not exist", "DAG 'dag_a' is paused"])
+def test_waits_for_a_free_slot_when_six_dags_run():
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    trigger = mock.Mock()
+    assert _poke(hook, trigger=trigger, active=6) is None
+    trigger.assert_not_called()
+    assert hook.status("dag_a") == m.STATUS_READY
+    assert _poke(hook, trigger=mock.Mock(return_value=CHILD_RUN_1), active=5) is None
+    assert hook.status("dag_a") == m.STATUS_TRIGGERED
+
+
+@pytest.mark.parametrize("error", ["DAG 'dag_a' does not exist in this Airflow", "DAG 'dag_a' is paused"])
 def test_trigger_error_marks_failed(error):
     hook = FakeImpalaHook.with_rows(row("dag_a"))
-    wait = mock.Mock()
     with pytest.raises(AirflowException, match=error):
-        _run(hook, trigger=mock.Mock(side_effect=AirflowException(error)), wait=wait)
-    wait.assert_not_called()
+        _poke(hook, trigger=mock.Mock(side_effect=AirflowException(error)))
     assert hook.status("dag_a") == m.STATUS_FAILED
-    assert hook.rows[0]["updated_ts"] == NOW and hook.rows[0]["triggered_ts"] is None
+    assert hook.rows[0]["triggered_ts"] is None
 
 
 def test_trigger_error_kept_when_failed_update_also_fails(monkeypatch):
@@ -456,89 +524,24 @@ def test_trigger_error_kept_when_failed_update_also_fails(monkeypatch):
     hook = FakeImpalaHook.with_rows(row("dag_a"))
     hook.fail_updates = 5
     with pytest.raises(AirflowException, match="does not exist"):
-        _run(hook, trigger=mock.Mock(side_effect=AirflowException("DAG 'dag_a' does not exist")))
+        _poke(hook, trigger=mock.Mock(side_effect=AirflowException("DAG 'dag_a' does not exist")))
 
 
-def test_wait_timeout_leaves_triggered_for_reconcile():
-    hook = FakeImpalaHook.with_rows(row("dag_a"))
-    with pytest.raises(m.ChildRunTimeout):
-        _run(hook, wait=mock.Mock(side_effect=m.ChildRunTimeout("still running")))
-    assert hook.status("dag_a") == m.STATUS_TRIGGERED
-
-
-def test_triggered_update_failure_does_not_stop_waiting(monkeypatch):
+def test_triggered_update_failure_is_fixed_by_the_final_update(monkeypatch):
     monkeypatch.setattr(m, "IMPALA_ATTEMPTS", 1)
     hook = FakeImpalaHook.with_rows(row("dag_a"))
     hook.fail_updates = 1  # the TRIGGERED update
-    assert _run(hook) == "success"
+    assert _poke(hook) is None
+    assert hook.status("dag_a") == m.STATUS_READY
+    assert _poke(hook, runs=[mine("success")]) == "success"
     assert hook.status("dag_a") == m.STATUS_SUCCEEDED  # final update also covers READY rows
 
 
-def test_retry_reattaches_to_own_run():
+def test_skips_dag_with_an_active_run_of_another_master_run():
     hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_TRIGGERED))
-    trigger, wait = mock.Mock(), mock.Mock(return_value="success")
-    own = m.ChildRun(CHILD_RUN_1, "running", "scheduled__1")
-    assert _run(hook, trigger, wait, existing=[own]) == "success"
-    trigger.assert_not_called()
-    wait.assert_called_once_with("dag_a", CHILD_RUN_1)
-    assert hook.status("dag_a") == m.STATUS_SUCCEEDED
-
-
-def test_skips_dag_owned_by_another_master_run():
-    hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_TRIGGERED))
-    trigger, wait = mock.Mock(), mock.Mock()
-    other = m.ChildRun(CHILD_RUN_1, "running", "scheduled__0")
-    assert _run(hook, trigger, wait, existing=[other]) == "skipped"
-    trigger.assert_not_called()
-    wait.assert_not_called()
-    assert hook.status("dag_a") == m.STATUS_TRIGGERED
-
-
-def test_skips_dag_finished_while_waiting_for_a_slot():
-    hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_SUCCEEDED))
     trigger = mock.Mock()
-    done = m.ChildRun(CHILD_RUN_1, "success", "scheduled__0")
-    assert _run(hook, trigger, existing=[done]) == "skipped"
-    trigger.assert_not_called()
-    assert hook.status("dag_a") == m.STATUS_SUCCEEDED
-
-
-def test_skips_when_another_master_run_wins_the_trigger_race():
-    hook = FakeImpalaHook.with_rows(row("dag_a"))
-    trigger = mock.Mock(side_effect=m.ChildRunAlreadyExists("taken"))
-    assert _run(hook, trigger) == "skipped"
-    assert hook.status("dag_a") == m.STATUS_READY
-
-
-def test_rerun_after_reset_to_ready_uses_next_attempt():
-    hook = FakeImpalaHook.with_rows(row("dag_a"))  # FAILED row was reset to READY
-    trigger = mock.Mock(return_value=f"upstream__{RUN_DATE}__2")
-    failed_before = m.ChildRun(CHILD_RUN_1, "failed", "scheduled__0")
-    assert _run(hook, trigger, existing=[failed_before]) == "success"
-    assert trigger.call_args.args[1] == f"upstream__{RUN_DATE}__2"
-    assert hook.status("dag_a") == m.STATUS_SUCCEEDED
-
-
-def test_only_selected_rows_are_updated():
-    # A row for the same DAG that became READY after selection keeps its status.
-    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=11), row("dag_a", load_id=12, dataset="late"))
-    assert _run(hook, load_ids=[11]) == "success"
-    assert {r["insert_load_id"]: r["status"] for r in hook.rows} == {11: m.STATUS_SUCCEEDED, 12: m.STATUS_READY}
-    assert all("insert_load_id IN (11)" in sql for sql in hook.executed if sql.lstrip().startswith("UPDATE"))
-
-
-def test_failure_updates_only_selected_rows():
-    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=11), row("dag_a", load_id=12, dataset="late"))
-    with pytest.raises(AirflowException):
-        _run(hook, wait=mock.Mock(return_value="failed"), load_ids=[11])
-    assert {r["insert_load_id"]: r["status"] for r in hook.rows} == {11: m.STATUS_FAILED, 12: m.STATUS_READY}
-
-
-def test_no_insert_load_ids_is_rejected():
-    hook = FakeImpalaHook.with_rows(row("dag_a"))
-    trigger = mock.Mock()
-    with pytest.raises(AirflowException, match="insert_load_id"):
-        _run(hook, trigger, load_ids=[])
+    with pytest.raises(AirflowSkipException, match="active run"):
+        _poke(hook, runs=[m.ChildRun(CHILD_RUN_1, "running", "scheduled__0")], trigger=trigger)
     trigger.assert_not_called()
 
 
@@ -546,7 +549,39 @@ def test_skips_when_selected_rows_are_no_longer_ready():
     hook = FakeImpalaHook.with_rows(row("dag_a", m.STATUS_SUCCEEDED, load_id=11),
                                     row("dag_a", load_id=12, dataset="late"))
     trigger = mock.Mock()
-    assert _run(hook, trigger, load_ids=[11]) == "skipped"
+    with pytest.raises(AirflowSkipException, match="no longer READY"):
+        _poke(hook, runs=[m.ChildRun(CHILD_RUN_1, "success", "scheduled__0")], trigger=trigger, load_ids=[11])
+    trigger.assert_not_called()
+
+
+def test_skips_when_another_run_wins_the_trigger_race():
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    with pytest.raises(AirflowSkipException):
+        _poke(hook, trigger=mock.Mock(side_effect=m.ChildRunAlreadyExists("taken")))
+    assert hook.status("dag_a") == m.STATUS_READY
+
+
+def test_rerun_after_reset_to_ready_uses_next_attempt():
+    hook = FakeImpalaHook.with_rows(row("dag_a"))  # FAILED row reset to READY
+    trigger = mock.Mock(return_value=f"upstream__{RUN_DATE}__2")
+    assert _poke(hook, runs=[m.ChildRun(CHILD_RUN_1, "failed", "scheduled__0")], trigger=trigger) is None
+    assert trigger.call_args.args[1] == f"upstream__{RUN_DATE}__2"
+    assert hook.status("dag_a") == m.STATUS_TRIGGERED
+
+
+def test_only_selected_rows_are_updated():
+    hook = FakeImpalaHook.with_rows(row("dag_a", load_id=11), row("dag_a", load_id=12, dataset="late"))
+    _poke(hook, load_ids=[11])
+    assert _poke(hook, runs=[mine("success")], load_ids=[11]) == "success"
+    assert {r["insert_load_id"]: r["status"] for r in hook.rows} == {11: m.STATUS_SUCCEEDED, 12: m.STATUS_READY}
+    assert all("insert_load_id IN (11)" in sql for sql in hook.executed if sql.lstrip().startswith("UPDATE"))
+
+
+def test_no_insert_load_ids_is_rejected():
+    hook = FakeImpalaHook.with_rows(row("dag_a"))
+    trigger = mock.Mock()
+    with pytest.raises(AirflowException, match="insert_load_id"):
+        _poke(hook, trigger=trigger, load_ids=[])
     trigger.assert_not_called()
 
 
@@ -672,51 +707,34 @@ def test_find_latest_child_run_escapes_like_wildcards(child_dag):
     assert m.find_latest_child_run("child_dag", RUN_DATE) is None
 
 
-@pytest.mark.parametrize("final_state", [DagRunState.SUCCESS, DagRunState.FAILED])
-def test_wait_for_dag_run_returns_final_state(child_dag, final_state):
-    run_id = m.trigger_child_dag("child_dag", f"wait_{final_state}")
-    polls = []
-
-    def fake_sleep(_seconds):
-        polls.append(1)
-        _set_state(run_id, DagRunState.RUNNING if len(polls) == 1 else final_state)
-
-    assert m.wait_for_dag_run("child_dag", run_id, poke_interval=0, sleep=fake_sleep) == final_state.value
-    assert len(polls) == 2
+def test_count_active_child_runs(child_dag):
+    assert m.count_active_child_runs() == 0
+    first = m.trigger_child_dag("child_dag", m.build_child_run_id(RUN_DATE, 1))     # queued
+    second = m.trigger_child_dag("child_dag", m.build_child_run_id("2026-10-10", 1))  # older day, running
+    _set_state(second, DagRunState.RUNNING)
+    m.trigger_child_dag("child_dag", "manual__not_ours")
+    assert m.count_active_child_runs() == 2
+    _set_state(first, DagRunState.SUCCESS)
+    assert m.count_active_child_runs() == 1
 
 
-def test_wait_for_dag_run_times_out(child_dag):
-    run_id = m.trigger_child_dag("child_dag", "wait_timeout")
-    now = [0.0]
-
-    def fake_sleep(seconds):
-        now[0] += seconds
-
-    with pytest.raises(m.ChildRunTimeout):
-        m.wait_for_dag_run("child_dag", run_id, poke_interval=60, timeout=300, sleep=fake_sleep,
-                           clock=lambda: now[0])
-    assert now[0] == 300
-
-
-def test_wait_for_dag_run_missing_run(airflow_db):
-    with pytest.raises(AirflowException, match="not found"):
-        m.wait_for_dag_run("child_dag", "missing")
-
-
-def test_trigger_and_wait_against_real_metadata_db(child_dag):
+def test_poke_against_real_metadata_db(child_dag):
     hook = FakeImpalaHook.with_rows(row("child_dag"))
-
-    def finish(dag_id, run_id):
-        _set_state(run_id, DagRunState.SUCCESS)
-        return m.wait_for_dag_run(dag_id, run_id, poke_interval=0)
-
     ids = hook.load_ids("child_dag")
-    assert m.trigger_and_wait(dag_name="child_dag", insert_load_ids=ids, run_date=RUN_DATE,
-                              parent_dag_id=m.DAG_ID, parent_run_id="p1", hook=hook, wait=finish) == "success"
+
+    def poke(parent):
+        return m.poke_upstream_dag(dag_name="child_dag", insert_load_ids=ids, run_date=RUN_DATE,
+                                   parent_dag_id=m.DAG_ID, parent_run_id=parent, hook=hook)
+
+    assert poke("p1") is None  # triggered
+    (run,) = m.list_child_runs("child_dag", RUN_DATE)
+    assert run.parent_run_id == "p1" and hook.status("child_dag") == m.STATUS_TRIGGERED
+    assert poke("p1") is None  # still queued
+    _set_state(run.run_id, DagRunState.SUCCESS)
+    assert poke("p1") == "success"
     assert hook.status("child_dag") == m.STATUS_SUCCEEDED
-    # A second master run for the same day does not trigger it again.
-    assert m.trigger_and_wait(dag_name="child_dag", insert_load_ids=ids, run_date=RUN_DATE,
-                              parent_dag_id=m.DAG_ID, parent_run_id="p2", hook=hook) == "skipped"
+    with pytest.raises(AirflowSkipException):  # a later master run does not trigger it again
+        poke("p2")
     assert len(m.list_child_runs("child_dag", RUN_DATE)) == 1
 
 
@@ -739,16 +757,19 @@ class World:
         self.hook = hook
         self.outcome: dict[str, str] = {}
         self.runs: dict[str, list[m.ChildRun]] = {}
+        self.hold: set[str] = set()  # DAGs that keep running
         self.cde_runs = 0
         self.seen_while_waiting: dict[str, str] = {}
         monkeypatch.setenv("AIRFLOW_CONN_ORACLE-CONN-EDWDB", EDW_CONN)
         monkeypatch.setattr(m, "get_impala_hook", lambda: hook)
         monkeypatch.setattr(m, "trigger_child_dag", self.trigger)
-        monkeypatch.setattr(m, "list_child_runs", lambda dag_id, _: list(reversed(self.runs.get(dag_id, []))))
+        monkeypatch.setattr(m, "list_child_runs", self.list_runs)
+        monkeypatch.setattr(m, "count_active_child_runs", self.count_active)
         monkeypatch.setattr(m, "find_latest_child_run",
                             lambda dag_id, _: (lambda r: (r[-1].run_id, r[-1].state) if r else None)(
                                 self.runs.get(dag_id, [])))
-        monkeypatch.setattr(m, "wait_for_dag_run", self.wait)
+        # Re-check immediately instead of after 60 s.
+        monkeypatch.setitem(m.dag.get_task("run_upstream_dag").partial_kwargs, "poke_interval", 0)
 
         def execute(op, context, **_):  # stands in for the CDE API call
             self.cde_runs += 1
@@ -757,19 +778,24 @@ class World:
 
     @property
     def triggered(self) -> list[str]:
-        return [dag for dag, runs in self.runs.items() for _ in runs]
+        return [dag for dag, runs in self.runs.items() for r in runs if r.parent_run_id != "earlier_run"]
 
     def trigger(self, dag_id, run_id, conf=None):
         if dag_id == "missing_dag":
             raise AirflowException("DAG 'missing_dag' does not exist")
-        self.runs.setdefault(dag_id, []).append(m.ChildRun(run_id, "queued", conf["parent_run_id"]))
+        self.runs.setdefault(dag_id, []).append(m.ChildRun(run_id, "running", conf["parent_run_id"]))
         return run_id
 
-    def wait(self, dag_id, run_id):
-        self.seen_while_waiting[dag_id] = self.hook.status(dag_id)
-        state = self.outcome.get(dag_id, "success")
-        self.runs[dag_id][-1] = m.ChildRun(run_id, state, self.runs[dag_id][-1].parent_run_id)
-        return state
+    def list_runs(self, dag_id, _run_date):
+        runs = self.runs.get(dag_id, [])
+        if runs and runs[-1].state == "running" and dag_id not in self.hold:
+            # The DAG finishes between two checks.
+            self.seen_while_waiting[dag_id] = self.hook.status(dag_id)
+            runs[-1] = m.ChildRun(runs[-1].run_id, self.outcome.get(dag_id, "success"), runs[-1].parent_run_id)
+        return list(reversed(runs))
+
+    def count_active(self):
+        return sum(r.state in ("queued", "running") for runs in self.runs.values() for r in runs)
 
     def run(self, hhmm: str):
         hour, minute = map(int, hhmm.split(":"))
@@ -786,7 +812,7 @@ def test_end_to_end_day(airflow_db, monkeypatch):
     world = World(monkeypatch, hook)
     world.outcome.update(dag_2="failed")
 
-    # 08:00 - five DAGs READY: triggered in parallel, each waited for and finalised.
+    # 08:00 - five DAGs READY: triggered, waited for (reschedule mode) and finalised.
     dag_run, states = world.run("08:00")
     assert sorted(world.triggered) == names[:5]
     assert world.seen_while_waiting == {n: m.STATUS_TRIGGERED for n in names[:5]}
@@ -794,17 +820,18 @@ def test_end_to_end_day(airflow_db, monkeypatch):
                                                    m.STATUS_SUCCEEDED, m.STATUS_SUCCEEDED]
     assert all(r["updated_ts"] == NOW for r in hook.rows if r["dag_name"] in names)
     assert hook.status("dag_old", "2026-10-10") == m.STATUS_READY
-    mapped = [s for (task_id, _), s in states.items() if task_id == "trigger_upstream_dag"]
+    mapped = [s for (task_id, _), s in states.items() if task_id == "run_upstream_dag"]
     assert sorted(mapped) == sorted([TaskInstanceState.SUCCESS] * 4 + [TaskInstanceState.FAILED])
-    labels = {ti.rendered_map_index for ti in dag_run.get_task_instances() if ti.task_id == "trigger_upstream_dag"}
-    assert labels == set(names[:5])  # the UI shows the DAG name per mapped task
+    if m.MAP_INDEX_KWARGS:
+        labels = {ti.rendered_map_index for ti in dag_run.get_task_instances() if ti.task_id == "run_upstream_dag"}
+        assert labels == set(names[:5])  # the UI shows the DAG name per mapped task
     assert states[("end", -1)] == TaskInstanceState.UPSTREAM_FAILED
     assert dag_run.state == DagRunState.FAILED  # a DAG failed: visible in the UI / alerts
 
     # 08:15 - nothing new: nothing triggered again.
     dag_run, states = world.run("08:15")
     assert dag_run.state == DagRunState.SUCCESS
-    assert states[("trigger_upstream_dag", -1)] == TaskInstanceState.SKIPPED
+    assert states[("run_upstream_dag", -1)] == TaskInstanceState.SKIPPED
     assert len(world.triggered) == 5
 
     # 08:30 - the sixth DAG becomes READY and succeeds.
@@ -814,7 +841,8 @@ def test_end_to_end_day(airflow_db, monkeypatch):
     assert hook.status("dag_5") == m.STATUS_SUCCEEDED
     assert sorted(world.triggered) == names
 
-    # 08:45 - all six finished: run stops early, no Spark job, until tomorrow.
+    # 08:45 - all six finished (plus duplicate rows): run stops early, no Spark job, until tomorrow.
+    hook.rows.append(dict(hook.rows[0]))
     cde_runs = world.cde_runs
     for hhmm in ("08:45", "09:00"):
         dag_run, states = world.run(hhmm)
@@ -847,9 +875,10 @@ def test_end_to_end_running_dags_count_against_the_limit(airflow_db, monkeypatch
     world = World(monkeypatch, hook)
     for i in range(4):
         world.runs[f"busy_{i}"] = [m.ChildRun(f"upstream__{RUN_DATE}__1", "running", "earlier_run")]
+        world.hold.add(f"busy_{i}")
 
     world.run("11:00")
-    assert sorted(d for d in world.triggered if d.startswith("new_")) == ["new_0", "new_1"]
+    assert sorted(world.triggered) == ["new_0", "new_1"]
     assert [hook.status(f"busy_{i}") for i in range(4)] == [m.STATUS_TRIGGERED] * 4
 
 

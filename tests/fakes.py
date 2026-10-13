@@ -88,5 +88,5 @@ class FakeImpalaHook:
                     and self._in_day(row, parameters)):
                 row["status"] = parameters["status"]
                 row["updated_ts"] = NOW
-                if "triggered_ts = now()" in sql:
+                if "triggered_ts =" in sql:
                     row["triggered_ts"] = NOW

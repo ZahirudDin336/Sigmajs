@@ -12,6 +12,7 @@ os.environ["AIRFLOW_HOME"] = _AIRFLOW_HOME
 os.environ["AIRFLOW__CORE__DAGS_FOLDER"] = str(ROOT / "dags")
 os.environ["AIRFLOW__CORE__LOAD_EXAMPLES"] = "False"
 os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
+os.environ["AIRFLOW__CORE__EXECUTOR"] = "SequentialExecutor"  # SQLite test DB
 os.environ["AIRFLOW__DATABASE__SQL_ALCHEMY_CONN"] = f"sqlite:///{_AIRFLOW_HOME}/airflow.db"
 os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
 # CDEJobRunOperator resolves its connection when the DAG is parsed. In CDE the
