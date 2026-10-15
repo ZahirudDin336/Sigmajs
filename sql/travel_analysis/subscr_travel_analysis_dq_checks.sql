@@ -23,23 +23,15 @@ FROM   ads.subscr_travel_analysis a
 LATERAL VIEW EXPLODE(SPLIT(a.travelling_country, ', ')) t AS c
 WHERE  TRIM(t.c) = '' OR t.c <> TRIM(t.c);
 
--- 4. QATAR not added by today's load (today's trips vs. their ads rows before the load)
-SELECT COUNT(*) AS qatar_added
-FROM   stg.subscr_travel_analysis_key a
-LATERAL VIEW EXPLODE(SPLIT(a.travelling_country, ',')) t AS c
-WHERE  UPPER(TRIM(t.c)) = 'QATAR'
-  AND  NOT EXISTS (SELECT 1
-                   FROM   stg.subscr_travel_analysis_src s
-                   WHERE  s.is_stg = 0
-                     AND  s.kind = 'C'
-                     AND  UPPER(s.val) = 'QATAR'
-                     AND  s.vf_number = a.vf_number
-                     AND  s.cust_key = COALESCE(a.cust_num, '#NULL#')
-                     AND  s.out_of_country_dt = a.out_of_country_dt);
+-- 4. QATAR never taken from today's file
+SELECT COUNT(*) AS qatar_in_delta
+FROM   stg.subscr_travel_analysis_delta
+WHERE  UPPER(country) = 'QATAR';
 
 -- 5. Every trip in today's file is in ads
 SELECT COUNT(*) AS missing_keys
-FROM   stg.subscr_travel_analysis_keys s
+FROM  (SELECT DISTINCT vf_number, cust_key, out_of_country_dt
+       FROM   stg.subscr_travel_analysis_delta) s
 LEFT   JOIN ads.subscr_travel_analysis a
   ON   s.vf_number = a.vf_number
  AND   s.cust_key = COALESCE(a.cust_num, '#NULL#')
