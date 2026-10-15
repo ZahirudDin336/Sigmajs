@@ -17,17 +17,26 @@
 --   * provider already in the list -> not concatenated (trimmed, exact match)
 --   * NULL / '' ignored; separator is '|||'
 --
--- Steps (no joins, each step is a stg work table):
---   1. stg.subscr_travel_analysis_src  : ads rows + landing rows, one row per
---                                        country / roaming provider (kind C / R)
---   2. stg.subscr_travel_analysis_item : one row per key + item (first occurrence)
---   3. stg.subscr_travel_analysis_key  : one row per key (merged)
---   4. INSERT OVERWRITE ads.subscr_travel_analysis from step 3
+-- Only trips present in today's file are re-computed; all other ads rows
+-- are copied unchanged by a map-only pass (broadcast join on the small
+-- key list). Requires ads to be in the normalised form this job writes
+-- (true after the 2-year rebuild or any earlier run of this job).
+--
+-- Steps:
+--   1. stg.subscr_travel_analysis_delta : today's landing rows, cleansed
+--   2. stg.subscr_travel_analysis_keys  : distinct trips in today's file
+--   3. stg.subscr_travel_analysis_hit   : current ads rows of those trips
+--   4. stg.subscr_travel_analysis_src   : 3 + 1, one row per country / provider
+--   5. stg.subscr_travel_analysis_item  : one row per trip + item (first occurrence)
+--   6. stg.subscr_travel_analysis_key   : one row per trip (merged)
+--   7. INSERT OVERWRITE ads = untouched ads rows + 6
 -- =====================================================================
 
 SET hive.vectorized.execution.enabled=true;
 SET hive.map.aggr=true;
 SET hive.optimize.reducededuplication=true;
+SET hive.auto.convert.join=true;
+SET hive.auto.convert.join.noconditionaltask=true;
 SET hive.stats.autogather=true;
 
 -- ---------------------------------------------------------------------
@@ -58,114 +67,143 @@ STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFo
 OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat';
 
 -- ---------------------------------------------------------------------
--- 1. ads + landing, one row per item
---    kind C = country, R = roaming provider
---    ord  = 15-digit sort key: src(1) + extract_dt(8) + position(6)
---      ads     : 0 + 00000000 + position in the existing list
---      landing : 1 + extract_dt + 000000
---    This table is also the snapshot of ads, so step 4 never reads the
---    table it overwrites.
+-- 1. today's landing rows, cleansed (QATAR / blank -> NULL, NULL return -> 2999)
+--    ord = 15-digit sort key: 1 + extract_dt(8) + 000000
+-- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS stg.subscr_travel_analysis_delta;
+CREATE TABLE stg.subscr_travel_analysis_delta STORED AS PARQUET AS
+SELECT TRIM(vf_number)                                                     AS vf_number,
+       COALESCE(NULLIF(TRIM(cust_num), ''), '#NULL#')                      AS cust_key,
+       CAST(FROM_UNIXTIME(CAST(out_of_country_dt / 1000 AS bigint)) AS timestamp) AS out_of_country_dt,
+       CAST(FROM_UNIXTIME(CAST(extract_dt / 1000 AS bigint), 'yyyyMMdd') AS int)  AS extract_dt,
+       CASE WHEN return_to_country_dt IS NULL
+            THEN CAST('2999-12-31 00:00:00' AS timestamp)
+            ELSE CAST(FROM_UNIXTIME(CAST(return_to_country_dt / 1000 AS bigint)) AS timestamp)
+       END                                                                 AS return_to_country_dt,
+       CONCAT('1', FROM_UNIXTIME(CAST(extract_dt / 1000 AS bigint), 'yyyyMMdd'), '000000') AS ord,
+       CASE WHEN UPPER(TRIM(travelling_country)) = 'QATAR' THEN NULL
+            ELSE NULLIF(TRIM(travelling_country), '')
+       END                                                                 AS country,
+       NULLIF(TRIM(roaming_sp_name), '')                                   AS roaming
+FROM   stg.subscr_travel_analysis
+WHERE  NULLIF(TRIM(vf_number), '') IS NOT NULL
+  AND  out_of_country_dt IS NOT NULL
+  AND  extract_dt IS NOT NULL;
+
+-- ---------------------------------------------------------------------
+-- 2. distinct trips in today's file (small -> broadcast in steps 3 and 7)
+-- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS stg.subscr_travel_analysis_keys;
+CREATE TABLE stg.subscr_travel_analysis_keys STORED AS PARQUET AS
+SELECT DISTINCT vf_number, cust_key, out_of_country_dt
+FROM   stg.subscr_travel_analysis_delta;
+
+-- ---------------------------------------------------------------------
+-- 3. current ads rows of today's trips (map join, no shuffle of ads)
+-- ---------------------------------------------------------------------
+DROP TABLE IF EXISTS stg.subscr_travel_analysis_hit;
+CREATE TABLE stg.subscr_travel_analysis_hit STORED AS PARQUET AS
+SELECT a.vf_number,
+       COALESCE(a.cust_num, '#NULL#')                                      AS cust_key,
+       a.out_of_country_dt,
+       a.return_to_country_dt,
+       a.travelling_country,
+       a.roaming_sp_name,
+       a.extract_dt
+FROM   ads.subscr_travel_analysis a
+JOIN   stg.subscr_travel_analysis_keys k
+  ON   a.vf_number = k.vf_number
+ AND   COALESCE(a.cust_num, '#NULL#') = k.cust_key
+ AND   a.out_of_country_dt = k.out_of_country_dt;
+
+-- ---------------------------------------------------------------------
+-- 4. one row per item: kind C = country, R = roaming provider
+--    ads items keep their list position: 0 + 00000000 + position(6)
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS stg.subscr_travel_analysis_src;
 CREATE TABLE stg.subscr_travel_analysis_src STORED AS PARQUET AS
-  -- existing ads countries (OUTER keeps rows with no country)
-  SELECT t.vf_number,
-         COALESCE(t.cust_num, '#NULL#')                                    AS cust_key,
-         t.out_of_country_dt,
+  -- existing countries (OUTER keeps rows with no country)
+  SELECT h.vf_number, h.cust_key, h.out_of_country_dt,
          0                                                                 AS is_stg,
-         t.extract_dt,
-         t.return_to_country_dt,
+         h.extract_dt,
+         h.return_to_country_dt,
          'C'                                                               AS kind,
          CONCAT('000000000', LPAD(CAST(c.pos AS string), 6, '0'))          AS ord,
          NULLIF(TRIM(c.val), '')                                           AS val
-  FROM   ads.subscr_travel_analysis t
-  LATERAL VIEW OUTER POSEXPLODE(SPLIT(t.travelling_country, ',')) c AS pos, val
+  FROM   stg.subscr_travel_analysis_hit h
+  LATERAL VIEW OUTER POSEXPLODE(SPLIT(h.travelling_country, ',')) c AS pos, val
 
   UNION ALL
 
-  -- existing ads roaming providers
-  SELECT t.vf_number,
-         COALESCE(t.cust_num, '#NULL#'),
-         t.out_of_country_dt,
-         0,
-         t.extract_dt,
-         t.return_to_country_dt,
+  -- existing roaming providers
+  SELECT h.vf_number, h.cust_key, h.out_of_country_dt, 0, h.extract_dt, h.return_to_country_dt,
          'R',
          CONCAT('000000000', LPAD(CAST(r.pos AS string), 6, '0')),
          NULLIF(TRIM(r.val), '')
-  FROM   ads.subscr_travel_analysis t
-  LATERAL VIEW POSEXPLODE(SPLIT(t.roaming_sp_name, '\\|\\|\\|')) r AS pos, val
+  FROM   stg.subscr_travel_analysis_hit h
+  LATERAL VIEW POSEXPLODE(SPLIT(h.roaming_sp_name, '\\|\\|\\|')) r AS pos, val
 
   UNION ALL
 
-  -- landing: QATAR / blank -> NULL, NULL return -> 2999-12-31
-  SELECT l.vf_number, l.cust_key, l.out_of_country_dt, 1, l.extract_dt, l.return_to_country_dt,
-         i.kind, l.ord, i.val
-  FROM  (SELECT TRIM(vf_number)                                            AS vf_number,
-                COALESCE(NULLIF(TRIM(cust_num), ''), '#NULL#')             AS cust_key,
-                CAST(FROM_UNIXTIME(CAST(out_of_country_dt / 1000 AS bigint)) AS timestamp) AS out_of_country_dt,
-                CAST(FROM_UNIXTIME(CAST(extract_dt / 1000 AS bigint), 'yyyyMMdd') AS int)  AS extract_dt,
-                CASE WHEN return_to_country_dt IS NULL
-                     THEN CAST('2999-12-31 00:00:00' AS timestamp)
-                     ELSE CAST(FROM_UNIXTIME(CAST(return_to_country_dt / 1000 AS bigint)) AS timestamp)
-                END                                                        AS return_to_country_dt,
-                CONCAT('1', FROM_UNIXTIME(CAST(extract_dt / 1000 AS bigint), 'yyyyMMdd'), '000000') AS ord,
-                CASE WHEN UPPER(TRIM(travelling_country)) = 'QATAR' THEN NULL
-                     ELSE NULLIF(TRIM(travelling_country), '')
-                END                                                        AS country,
-                NULLIF(TRIM(roaming_sp_name), '')                          AS roaming
-         FROM   stg.subscr_travel_analysis
-         WHERE  NULLIF(TRIM(vf_number), '') IS NOT NULL
-           AND  out_of_country_dt IS NOT NULL
-           AND  extract_dt IS NOT NULL) l
-  LATERAL VIEW EXPLODE(MAP('C', l.country, 'R', l.roaming)) i AS kind, val;
+  -- today's countries and providers
+  SELECT d.vf_number, d.cust_key, d.out_of_country_dt, 1, d.extract_dt, d.return_to_country_dt,
+         i.kind, d.ord, i.val
+  FROM   stg.subscr_travel_analysis_delta d
+  LATERAL VIEW EXPLODE(MAP('C', d.country, 'R', d.roaming)) i AS kind, val;
 
 -- ---------------------------------------------------------------------
--- 2. one row per key + item: first occurrence wins -> no duplicates
+-- 5. one row per trip + item: first occurrence wins -> no duplicates
 --    countries match case-insensitive, providers match exactly
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS stg.subscr_travel_analysis_item;
 CREATE TABLE stg.subscr_travel_analysis_item STORED AS PARQUET AS
-  SELECT vf_number, cust_key, out_of_country_dt, kind,
-         MIN(CONCAT(ord, '#', val))                                        AS first_item,
-         MAX(is_stg)                                                       AS has_stg,
-         MAX(extract_dt)                                                   AS extract_dt,
-         MAX(IF(is_stg = 0, return_to_country_dt, NULL))                   AS ads_return,
-         -- latest real (not open) return date from landing
-         MAX(IF(is_stg = 1 AND return_to_country_dt < CAST('2999-12-31 00:00:00' AS timestamp),
-                NAMED_STRUCT('e', extract_dt, 'v', return_to_country_dt), NULL)) AS stg_return
-  FROM   stg.subscr_travel_analysis_src
-  GROUP  BY vf_number, cust_key, out_of_country_dt, kind,
-            IF(kind = 'C', UPPER(val), val);
+SELECT vf_number, cust_key, out_of_country_dt, kind,
+       MIN(CONCAT(ord, '#', val))                                          AS first_item,
+       MAX(extract_dt)                                                     AS extract_dt,
+       MAX(IF(is_stg = 0, return_to_country_dt, NULL))                     AS ads_return,
+       -- latest real (not open) return date from landing
+       MAX(IF(is_stg = 1 AND return_to_country_dt < CAST('2999-12-31 00:00:00' AS timestamp),
+              NAMED_STRUCT('e', extract_dt, 'v', return_to_country_dt), NULL)) AS stg_return
+FROM   stg.subscr_travel_analysis_src
+GROUP  BY vf_number, cust_key, out_of_country_dt, kind,
+          IF(kind = 'C', UPPER(val), val);
 
 -- ---------------------------------------------------------------------
--- 3. one row per key
+-- 6. one row per trip
 -- ---------------------------------------------------------------------
 DROP TABLE IF EXISTS stg.subscr_travel_analysis_key;
 CREATE TABLE stg.subscr_travel_analysis_key STORED AS PARQUET AS
-  SELECT vf_number, cust_key, out_of_country_dt,
-         SORT_ARRAY(COLLECT_LIST(IF(kind = 'C', first_item, NULL)))        AS countries,
-         SORT_ARRAY(COLLECT_LIST(IF(kind = 'R', first_item, NULL)))        AS roamings,
-         MAX(has_stg)                                                      AS has_stg,
-         MAX(extract_dt)                                                   AS extract_dt,
-         MAX(ads_return)                                                   AS ads_return,
-         MAX(stg_return).v                                                 AS stg_return
-  FROM   stg.subscr_travel_analysis_item
-  GROUP  BY vf_number, cust_key, out_of_country_dt;
-
--- ---------------------------------------------------------------------
--- 4. final load
--- ---------------------------------------------------------------------
-INSERT OVERWRITE TABLE ads.subscr_travel_analysis
 SELECT vf_number,
        NULLIF(cust_key, '#NULL#')                                          AS cust_num,
        out_of_country_dt,
-       -- key in today's file: latest real landing date, else ads date, else open
-       -- key not in today's file: unchanged
-       IF(has_stg = 1,
-          COALESCE(stg_return, ads_return, CAST('2999-12-31 00:00:00' AS timestamp)),
-          ads_return)                                                      AS return_to_country_dt,
-       NULLIF(REGEXP_REPLACE(CONCAT_WS(', ', countries), '[0-9]{15}#', ''), '')   AS travelling_country,
-       NULLIF(REGEXP_REPLACE(CONCAT_WS('|||', roamings), '[0-9]{15}#', ''), '')   AS roaming_sp_name,
-       extract_dt
+       -- latest real landing date, else ads date, else open
+       COALESCE(MAX(stg_return).v, MAX(ads_return),
+                CAST('2999-12-31 00:00:00' AS timestamp))                  AS return_to_country_dt,
+       NULLIF(REGEXP_REPLACE(CONCAT_WS(', ',
+                SORT_ARRAY(COLLECT_LIST(IF(kind = 'C', first_item, NULL)))),
+              '[0-9]{15}#', ''), '')                                       AS travelling_country,
+       NULLIF(REGEXP_REPLACE(CONCAT_WS('|||',
+                SORT_ARRAY(COLLECT_LIST(IF(kind = 'R', first_item, NULL)))),
+              '[0-9]{15}#', ''), '')                                       AS roaming_sp_name,
+       MAX(extract_dt)                                                     AS extract_dt
+FROM   stg.subscr_travel_analysis_item
+GROUP  BY vf_number, cust_key, out_of_country_dt;
+
+-- ---------------------------------------------------------------------
+-- 7. final load: untouched rows (map-only anti join) + today's trips
+-- ---------------------------------------------------------------------
+INSERT OVERWRITE TABLE ads.subscr_travel_analysis
+SELECT a.vf_number, a.cust_num, a.out_of_country_dt, a.return_to_country_dt,
+       a.travelling_country, a.roaming_sp_name, a.extract_dt
+FROM   ads.subscr_travel_analysis a
+LEFT   JOIN stg.subscr_travel_analysis_keys k
+  ON   a.vf_number = k.vf_number
+ AND   COALESCE(a.cust_num, '#NULL#') = k.cust_key
+ AND   a.out_of_country_dt = k.out_of_country_dt
+WHERE  k.vf_number IS NULL
+
+UNION ALL
+
+SELECT vf_number, cust_num, out_of_country_dt, return_to_country_dt,
+       travelling_country, roaming_sp_name, extract_dt
 FROM   stg.subscr_travel_analysis_key;
