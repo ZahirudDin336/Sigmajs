@@ -6,7 +6,8 @@
 --   travelling_country : first appearance order (extract_dt, then name),
 --                        trimmed, case-insensitive distinct, QATAR / NULL /
 --                        '' ignored, separator ', '
---   roaming_sp_name    : distinct, newest first appearance first, '|||'
+--   roaming_sp_name    : distinct, oldest first appearance first, new ones
+--                        appended at the end, separator '|||'
 --   return_to_country_dt: latest real return date by extract_dt, else 2999
 --   extract_dt         : latest extract_dt of the trip
 --   trips with only QATAR / NULL countries are kept (country NULL)
@@ -61,11 +62,9 @@ SELECT vf_number,
        NULLIF(REGEXP_REPLACE(CONCAT_WS(', ',
                 SORT_ARRAY(COLLECT_LIST(IF(kind = 'C', first_item, NULL)))),
               '[0-9]{8}#', ''), '')                                        AS travelling_country,
-       -- roaming: newest first (sort key 99999999 - yyyyMMdd)
+       -- roaming: oldest first, new ones at the end
        NULLIF(REGEXP_REPLACE(CONCAT_WS('|||',
-                SORT_ARRAY(COLLECT_LIST(IF(kind = 'R',
-                  CONCAT(LPAD(CAST(99999999 - CAST(SUBSTR(first_item, 1, 8) AS int) AS string), 8, '0'),
-                         SUBSTR(first_item, 9)), NULL)))),
+                SORT_ARRAY(COLLECT_LIST(IF(kind = 'R', first_item, NULL)))),
               '[0-9]{8}#', ''), '')                                        AS roaming_sp_name,
        MAX(extract_dt)                                                     AS extract_dt
 FROM   dev_stg.travel_analysis_fix_20261004_item

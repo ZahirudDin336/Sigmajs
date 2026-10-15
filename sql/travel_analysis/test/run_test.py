@@ -84,7 +84,8 @@ spark.sql(f"""INSERT INTO ads.subscr_travel_analysis VALUES
  ('A6', NULL, TIMESTAMP'2026-09-01 00:00:00', TIMESTAMP'{OPEN}', 'Oman', 'R', 20260930),
  ('A7', 'C7', TIMESTAMP'2026-09-01 00:00:00', TIMESTAMP'{OPEN}', 'India,UAE', NULL, 20260930),
  ('A9', 'C9', TIMESTAMP'2026-09-01 00:00:00', TIMESTAMP'{OPEN}', ' Oman ', NULL, 20260930),
- ('A10','C10',TIMESTAMP'2026-09-01 00:00:00', TIMESTAMP'{OPEN}', 'India', NULL, 20260930)
+ ('A10','C10',TIMESTAMP'2026-09-01 00:00:00', TIMESTAMP'{OPEN}', 'India', NULL, 20260930),
+ ('A13','C13',TIMESTAMP'2026-09-01 00:00:00', TIMESTAMP'{OPEN}', 'Iran', 'P ||| Q', 20260930)
 """)
 
 # extract, vf, cust, out, return, country, roaming
@@ -108,6 +109,9 @@ DAY1 = [
     (D1, "A11", "C11", T1, None, "France", None),
     (D2, "A12", "C12", T1, None, "Peru", None),                   # new key, later extract_dt first in file
     (D1, "A12", "C12", T1, None, "Chile", None),
+    (D1, "A13", "C13", T1, None, "Iran", "Q"),                    # provider already in list (spaced '|||')
+    (D1, "A13", "C13", T1, None, "Iran", "T"),                    # two new providers, same extract_dt
+    (D1, "A13", "C13", T1, None, "Iran", "S"),
     (D1, None, "C99", T1, None, "Peru", None),                    # NULL vf_number rejected
 ]
 DAY2 = [
@@ -121,11 +125,13 @@ DAY2 = [
     (D2, "A10", "C10", T1, None, "india", None),
     (D2, "A10", "C10", T1, None, "Brazil", None),
     (D2, "A11", "C11", T1, None, "germany", None),                # nothing new
+    (D2, "A13", "C13", T1, None, "Iran", "U"),                    # new provider appended at the end
+    (D2, "A13", "C13", T1, None, "Iran", "P"),
 ]
 
 EXP_DAY1 = {
     # vf: (cust, return, travelling_country, roaming, extract_dt)
-    "A1":  ("C1", "2026-09-25 00:00:00", "India, UAE", "Vodafone|||Ooredoo", 20261001),
+    "A1":  ("C1", "2026-09-25 00:00:00", "India, UAE", "Ooredoo|||Vodafone", 20261001),
     "A2":  ("C2", OPEN, None, None, 20261001),
     "A3":  ("C3", "2026-09-20 00:00:00", "UK", "A", 20261001),
     "A4":  ("C4", OPEN, "Spain", None, 20261001),
@@ -137,13 +143,15 @@ EXP_DAY1 = {
     "A10": ("C10", OPEN, "India, Kenya, Oman", None, 20261001),
     "A11": ("C11", OPEN, "France, Germany", None, 20261001),
     "A12": ("C12", OPEN, "Chile, Peru", None, 20261002),
+    "A13": ("C13", OPEN, "Iran", "P|||Q|||S|||T", 20261001),
 }
 EXP_DAY2 = dict(EXP_DAY1, **{
-    "A1":  ("C1", "2026-09-25 00:00:00", "India, UAE, Oman", "Vodafone|||Ooredoo", 20261002),
+    "A1":  ("C1", "2026-09-25 00:00:00", "India, UAE, Oman", "Ooredoo|||Vodafone", 20261002),
     "A2":  ("C2", OPEN, "Kenya", "X", 20261003),
     "A4":  ("C4", OPEN, "Spain, France", None, 20261002),
     "A10": ("C10", OPEN, "India, Kenya, Oman, Brazil", None, 20261002),
     "A11": ("C11", OPEN, "France, Germany", None, 20261002),
+    "A13": ("C13", OPEN, "Iran", "P|||Q|||S|||T|||U", 20261002),
 })
 
 

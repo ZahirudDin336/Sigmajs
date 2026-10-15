@@ -31,7 +31,8 @@ WHERE  UPPER(TRIM(t.c)) = 'QATAR'
   AND  NOT EXISTS (SELECT 1
                    FROM   stg.subscr_travel_analysis_src s
                    WHERE  s.is_stg = 0
-                     AND  UPPER(s.country) = 'QATAR'
+                     AND  s.kind = 'C'
+                     AND  UPPER(s.val) = 'QATAR'
                      AND  s.vf_number = a.vf_number
                      AND  s.cust_key = COALESCE(a.cust_num, '#NULL#')
                      AND  s.out_of_country_dt = a.out_of_country_dt);
@@ -46,3 +47,11 @@ LEFT   JOIN ads.subscr_travel_analysis a
  AND   s.cust_key = COALESCE(a.cust_num, '#NULL#')
  AND   s.out_of_country_dt = a.out_of_country_dt
 WHERE  a.vf_number IS NULL;
+
+-- 6. No duplicate roaming provider inside roaming_sp_name
+SELECT COUNT(*) AS dup_roaming
+FROM  (SELECT a.vf_number, a.cust_num, a.out_of_country_dt, TRIM(t.r) r
+       FROM   ads.subscr_travel_analysis a
+       LATERAL VIEW EXPLODE(SPLIT(a.roaming_sp_name, '\\|\\|\\|')) t AS r
+       GROUP  BY a.vf_number, a.cust_num, a.out_of_country_dt, TRIM(t.r)
+       HAVING COUNT(*) > 1) x;

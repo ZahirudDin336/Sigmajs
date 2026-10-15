@@ -82,6 +82,11 @@ HIST = [
     # T7: same country on later days -> extract_dt must move forward
     ("2026-01-01", "T7", "C7", OUT, None, "Oman", None),
     ("2026-01-04", "T7", "C7", OUT, None, "Oman", "Z"),
+    # T8: roaming providers, two on the same day, one repeated later, padded
+    ("2026-01-01", "T8", "C8", OUT, None, "Iraq", "B"),
+    ("2026-01-01", "T8", "C8", OUT, None, "Iraq", "A"),
+    ("2026-01-02", "T8", "C8", OUT, None, "Iraq", " C "),
+    ("2026-01-03", "T8", "C8", OUT, None, "Iraq", "A"),
 ]
 
 # (a) daily replay ------------------------------------------------------
